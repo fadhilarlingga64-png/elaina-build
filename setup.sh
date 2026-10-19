@@ -244,29 +244,167 @@ object Bg {
 }
 __XH_EOF__
 mkdir -p "app/src/main/java/com/crosshair/pro"
+cat > "app/src/main/java/com/crosshair/pro/Injector.kt" <<'__XH_EOF__'
+package com.crosshair.pro
+
+import android.os.IBinder
+import android.os.SystemClock
+import android.view.InputDevice
+import android.view.InputEvent
+import android.view.MotionEvent
+import java.lang.reflect.Method
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
+
+/**
+ * Dijalankan lewat Shizuku: CLASSPATH=base.apk app_process /system/bin com.crosshair.pro.Injector
+ * Perintah (satu per baris di stdin):
+ *   S id x y cps -> mulai mengetuk (cps 0 = secepat mungkin)   E id -> berhenti
+ *   T x y        -> satu ketukan                                Q    -> keluar
+ */
+object Injector {
+    private var im: Any? = null
+    private var inject: Method? = null
+    private val flags = ConcurrentHashMap<Int, AtomicBoolean>()
+
+    private fun resolve() {
+        val it = Int::class.javaPrimitiveType
+        var err = ""
+        for (name in arrayOf("android.hardware.input.InputManager", "android.hardware.input.InputManagerGlobal")) {
+            try {
+                val cls = Class.forName(name)
+                val o = cls.getDeclaredMethod("getInstance").invoke(null)
+                val m = cls.getMethod("injectInputEvent", InputEvent::class.java, it)
+                im = o; inject = m
+                return
+            } catch (e: Throwable) { err += name.substringAfterLast('.') + ": " + e + "; " }
+        }
+        try {
+            val sm = Class.forName("android.os.ServiceManager")
+            val binder = sm.getMethod("getService", String::class.java).invoke(null, "input") as IBinder
+            val stub = Class.forName("android.hardware.input.IInputManager\$Stub")
+            val o = stub.getMethod("asInterface", IBinder::class.java).invoke(null, binder)
+            val m = o!!.javaClass.getMethod("injectInputEvent", InputEvent::class.java, it)
+            im = o; inject = m
+            return
+        } catch (e: Throwable) { err += "IInputManager: " + e }
+        throw RuntimeException(err)
+    }
+
+    @JvmStatic
+    fun main(args: Array<String>) {
+        try {
+            resolve()
+            println("READY")
+            System.out.flush()
+            val br = System.`in`.bufferedReader()
+            while (true) {
+                val line = br.readLine() ?: break
+                val p = line.trim().split(" ")
+                if (p[0] == "Q") break
+                try {
+                    when (p[0]) {
+                        "S" -> start(p[1].toInt(), p[2].toInt(), p[3].toInt(), p[4].toInt())
+                        "E" -> stop(p[1].toInt())
+                        "T" -> tap(p[1].toInt(), p[2].toInt())
+                    }
+                } catch (e: Throwable) {
+                    println("ERR " + e)
+                    System.out.flush()
+                }
+            }
+        } catch (e: Throwable) {
+            println("ERR " + e)
+            System.out.flush()
+        }
+        System.exit(0)
+    }
+
+    private fun send(action: Int, downTime: Long, x: Float, y: Float) {
+        val props = arrayOf(MotionEvent.PointerProperties())
+        props[0].id = 0
+        props[0].toolType = MotionEvent.TOOL_TYPE_FINGER
+        val coords = arrayOf(MotionEvent.PointerCoords())
+        coords[0].x = x
+        coords[0].y = y
+        coords[0].pressure = 1f
+        coords[0].size = 1f
+        val now = SystemClock.uptimeMillis()
+        val ev = MotionEvent.obtain(downTime, now, action, 1, props, coords, 0, 0, 1f, 1f, -1, 0, InputDevice.SOURCE_TOUCHSCREEN, 0)
+        inject!!.invoke(im, ev, 0)
+        ev.recycle()
+    }
+
+    private fun tap(x: Int, y: Int) {
+        val t0 = SystemClock.uptimeMillis()
+        send(MotionEvent.ACTION_DOWN, t0, x.toFloat(), y.toFloat())
+        Thread.sleep(20)
+        send(MotionEvent.ACTION_UP, t0, x.toFloat(), y.toFloat())
+    }
+
+    private fun start(id: Int, x: Int, y: Int, cps: Int) {
+        stop(id)
+        val f = AtomicBoolean(true)
+        flags[id] = f
+        val t = Thread {
+            val period = if (cps > 0) 1000L / cps else 0L
+            val press = if (cps in 1..8) 25L else 8L
+            while (f.get()) {
+                val t0 = SystemClock.uptimeMillis()
+                try {
+                    send(MotionEvent.ACTION_DOWN, t0, x.toFloat(), y.toFloat())
+                    Thread.sleep(press)
+                    send(MotionEvent.ACTION_UP, t0, x.toFloat(), y.toFloat())
+                } catch (e: Throwable) {
+                    println("ERR " + e)
+                    System.out.flush()
+                    break
+                }
+                val rest = if (cps > 0) period - (SystemClock.uptimeMillis() - t0) else 8L
+                if (rest > 0) {
+                    try { Thread.sleep(rest) } catch (e: Throwable) { break }
+                }
+            }
+        }
+        t.isDaemon = true
+        t.start()
+    }
+
+    private fun stop(id: Int) {
+        flags.remove(id)?.set(false)
+    }
+}
+__XH_EOF__
+mkdir -p "app/src/main/java/com/crosshair/pro"
 cat > "app/src/main/java/com/crosshair/pro/Keymap.kt" <<'__XH_EOF__'
 package com.crosshair.pro
 
 import android.content.Context
+import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Paint
 import android.graphics.PixelFormat
 import android.graphics.drawable.GradientDrawable
+import android.os.Handler
+import android.os.Looper
 import android.util.DisplayMetrics
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
+import android.widget.LinearLayout
 import android.widget.TextView
+import android.widget.Toast
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.concurrent.locks.ReentrantLock
 
-class KmItem(var name: String, var mode: Int, var spd: Int, var hx: Int, var hy: Int, var tx: Int, var ty: Int)
+class KmItem(var name: String, var mode: Int, var spd: Int, var hx: Int, var hy: Int, var tx: Int, var ty: Int, var trig: Int = 0)
 
 object Km {
     val SPD = listOf("Biasa", "Sedang", "Cepat", "Gila")
-    val CPS = intArrayOf(4, 8, 14, 0)
-
+    val CPS = intArrayOf(5, 10, 20, 0)
+    val TRIG = listOf("Layar", "Vol -", "Vol +")
     private fun prefs(c: Context) = c.getSharedPreferences("xh_km", Context.MODE_PRIVATE)
 
     fun load(c: Context): MutableList<KmItem> {
@@ -276,7 +414,7 @@ object Km {
             for (i in 0 until a.length()) {
                 val o = a.getJSONObject(i)
                 out.add(KmItem(o.optString("n", "A"), o.optInt("m", 0), o.optInt("s", 2),
-                    o.optInt("hx", 850), o.optInt("hy", 600), o.optInt("tx", 700), o.optInt("ty", 500)))
+                    o.optInt("hx", 850), o.optInt("hy", 600), o.optInt("tx", 700), o.optInt("ty", 500), o.optInt("t", 0)))
             }
         } catch (e: Exception) { }
         return out
@@ -286,7 +424,7 @@ object Km {
         val a = JSONArray()
         for (k in l) {
             val o = JSONObject()
-            o.put("n", k.name); o.put("m", k.mode); o.put("s", k.spd)
+            o.put("n", k.name); o.put("m", k.mode); o.put("s", k.spd); o.put("t", k.trig)
             o.put("hx", k.hx); o.put("hy", k.hy); o.put("tx", k.tx); o.put("ty", k.ty)
             a.put(o)
         }
@@ -295,15 +433,19 @@ object Km {
 
     fun newItem(n: Int): KmItem {
         val i = n.coerceIn(0, 5)
-        return KmItem("ABCDEF"[i].toString(), 0, 2, 880, 300 + i * 110, 650, 250 + i * 110)
+        return KmItem("ABCDEF"[i].toString(), 0, 2, 880, 300 + i * 110, 650, 250 + i * 110, 0)
+    }
+
+    fun rename(l: MutableList<KmItem>) {
+        for (i in l.indices) l[i].name = "ABCDEF"[i.coerceIn(0, 5)].toString()
     }
 }
 
-/** Mengetuk satu titik berulang-ulang lewat shell Shizuku selama diaktifkan. */
+/** Mesin cadangan: `input tap` berulang lewat shell Shizuku. */
 class TapJob {
     @Volatile var x = 0
     @Volatile var y = 0
-    @Volatile var cps = 4
+    @Volatile var cps = 5
     @Volatile private var running = false
     @Volatile private var alive = true
     private var started = false
@@ -360,10 +502,169 @@ class TapJob {
     }
 }
 
-/** Tombol keymap melayang: tombol tahan (merah) dan titik target (biru). */
+/** Mesin ketuk: injector cepat (app_process lewat Shizuku) dengan cadangan `input tap`. */
+object Tap {
+    @Volatile var label = "Belum aktif"
+    @Volatile var fast = false
+    @Volatile var lastErr = ""
+    private var proc: Process? = null
+    private var out: java.io.OutputStream? = null
+    private val jobs = HashMap<Int, TapJob>()
+
+    /** Blocking (maks sekitar 5 detik). eng: 0 otomatis, 1 cepat saja, 2 standar saja. */
+    fun ensure(c: Context, eng: Int): Boolean {
+        if (!Shz.ready()) { label = "Shizuku belum terhubung"; return false }
+        if (eng == 2) { label = "STANDAR (input tap)"; return true }
+        if (fast) return true
+        startInjector(c)
+        if (fast) return true
+        if (eng == 1) { label = "Injector gagal: " + lastErr; return false }
+        label = "STANDAR (injector gagal: " + lastErr + ")"
+        return true
+    }
+
+    @Synchronized
+    private fun startInjector(c: Context) {
+        if (fast) return
+        try {
+            val apk = c.applicationInfo.sourceDir
+            val cmd = "CLASSPATH='" + apk + "' exec app_process /system/bin com.crosshair.pro.Injector 2>&1"
+            val p = Shz.proc(arrayOf("sh", "-c", cmd))
+            proc = p
+            out = p.outputStream
+            val timer = Thread {
+                try { Thread.sleep(5000) } catch (e: Exception) { }
+                if (!fast) { try { p.destroy() } catch (e: Throwable) { } }
+            }
+            timer.isDaemon = true
+            timer.start()
+            val r = p.inputStream.bufferedReader()
+            val first = r.readLine()
+            if (first == "READY") {
+                fast = true
+                label = "CEPAT (injector)"
+                val rd = Thread {
+                    try {
+                        while (true) {
+                            val l = r.readLine() ?: break
+                            if (l.startsWith("ERR")) lastErr = l
+                        }
+                    } catch (e: Throwable) { }
+                    fast = false
+                    out = null
+                }
+                rd.isDaemon = true
+                rd.start()
+            } else {
+                lastErr = first ?: "tidak ada respons"
+                out = null
+                proc = null
+            }
+        } catch (e: Throwable) {
+            lastErr = e.message ?: "error"
+            out = null
+            proc = null
+        }
+    }
+
+    private fun send(line: String) {
+        val o = out ?: return
+        try { synchronized(this) { o.write((line + "\n").toByteArray()); o.flush() } } catch (e: Throwable) { fast = false }
+    }
+
+    fun start(id: Int, x: Int, y: Int, cps: Int) {
+        if (fast) { send("S $id $x $y $cps"); return }
+        val j = synchronized(jobs) { jobs.getOrPut(id) { TapJob() } }
+        j.x = x; j.y = y; j.cps = cps
+        j.setRunning(true)
+    }
+
+    fun stop(id: Int) {
+        if (fast) send("E $id")
+        val j = synchronized(jobs) { jobs[id] }
+        j?.setRunning(false)
+    }
+
+    fun tap(x: Int, y: Int): Boolean {
+        if (fast) { send("T $x $y"); return true }
+        return !Shz.exec("input tap $x $y").startsWith("ERR")
+    }
+
+    fun shutdown() {
+        send("Q")
+        try { proc?.destroy() } catch (e: Throwable) { }
+        fast = false
+        out = null
+        proc = null
+        synchronized(jobs) { for (j in jobs.values) j.shutdown(); jobs.clear() }
+        label = "Belum aktif"
+    }
+}
+
+/** Membaca tombol volume fisik lewat getevent (Shizuku) sebagai pemicu tanpa menyentuh layar. */
+object KeyWatch {
+    @Volatile var active = false
+    private var proc: Process? = null
+
+    fun start(onKey: (String, Boolean) -> Unit) {
+        if (active || !Shz.ready()) return
+        active = true
+        Thread {
+            try {
+                val p = Shz.proc(arrayOf("sh", "-c", "getevent -l 2>&1"))
+                proc = p
+                val r = p.inputStream.bufferedReader()
+                while (active) {
+                    val l = r.readLine() ?: break
+                    val t = l.trim().split(Regex("\\s+"))
+                    val st = t.lastOrNull()
+                    if (t.contains("KEY_VOLUMEDOWN")) onKey("VD", st == "DOWN")
+                    else if (t.contains("KEY_VOLUMEUP")) onKey("VU", st == "DOWN")
+                }
+            } catch (e: Throwable) { }
+            active = false
+        }.start()
+    }
+
+    fun stop() {
+        active = false
+        try { proc?.destroy() } catch (e: Throwable) { }
+        proc = null
+    }
+}
+
+/** Papan uji: menghitung ketukan yang benar-benar masuk. */
+class PadView(ctx: Context) : View(ctx) {
+    @Volatile var count = 0
+    var msg = "Papan uji ketukan"
+    private val p = Paint(Paint.ANTI_ALIAS_FLAG)
+    fun reset() { count = 0 }
+    override fun onTouchEvent(e: MotionEvent): Boolean {
+        if (e.actionMasked == MotionEvent.ACTION_DOWN) { count++; invalidate() }
+        return true
+    }
+    override fun onDraw(c: Canvas) {
+        p.style = Paint.Style.FILL
+        p.color = 0xFF1B1B27.toInt()
+        c.drawRect(0f, 0f, width.toFloat(), height.toFloat(), p)
+        p.style = Paint.Style.STROKE
+        p.strokeWidth = 4f
+        p.color = C.RED
+        c.drawRect(2f, 2f, width - 2f, height - 2f, p)
+        p.style = Paint.Style.FILL
+        p.color = Color.WHITE
+        p.textSize = 22f * resources.displayMetrics.density / 2f
+        p.textAlign = Paint.Align.CENTER
+        c.drawText("Masuk: $count ketukan", width / 2f, height / 2f - 8f, p)
+        p.color = C.MUTE
+        p.textSize = 14f * resources.displayMetrics.density / 2f
+        c.drawText(msg, width / 2f, height / 2f + 28f, p)
+    }
+}
+
+/** Tombol keymap melayang + editor langsung di dalam game. */
 class KeyLayer(private val c: Context, private val wm: WindowManager, private val scr: () -> DisplayMetrics) {
-    private class PV(val m: KmItem) {
-        val job = TapJob()
+    private class PV(val m: KmItem, val id: Int) {
         var hold: TextView? = null
         var mark: TextView? = null
         var hlp: WindowManager.LayoutParams? = null
@@ -372,31 +673,53 @@ class KeyLayer(private val c: Context, private val wm: WindowManager, private va
     }
 
     private val list = ArrayList<PV>()
+    private val mh = Handler(Looper.getMainLooper())
+    private var nextId = 1
+    private var sel: PV? = null
     var shown = false
         private set
     var edit = false
         private set
+    var onEditChange: (() -> Unit)? = null
+    private var bar: LinearLayout? = null
+    private var barLp: WindowManager.LayoutParams? = null
+    private var barTop = true
+    private var selT: TextView? = null
+    private val painters = ArrayList<() -> Unit>()
     private val base = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
         WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or WindowManager.LayoutParams.FLAG_SPLIT_TOUCH
     private val hs: Int get() = c.dp(60)
     private val ms: Int get() = c.dp(44)
 
+    private fun toast(t: String) { Toast.makeText(c, t, Toast.LENGTH_SHORT).show() }
+
+    // ---------- siklus hidup ----------
     fun show() {
         if (shown) return
         edit = false
-        for (m in Km.load(c)) { val pv = PV(m); build(pv); list.add(pv) }
+        for (m in Km.load(c)) { val pv = PV(m, nextId++); build(pv); list.add(pv) }
+        sel = null
         shown = true
+        if (Shz.ready()) {
+            val app = c.applicationContext
+            val eng = Spec(app).i("kmEng")
+            Thread { Tap.ensure(app, eng) }.start()
+        }
+        updateWatch()
     }
 
     fun hide() {
+        closeBar()
         for (pv in list) {
-            pv.job.shutdown()
-            try { pv.hold?.let { wm.removeViewImmediate(it) } } catch (e: Exception) { }
+            Tap.stop(pv.id)
+            removeHold(pv)
             try { pv.mark?.let { wm.removeViewImmediate(it) } } catch (e: Exception) { }
         }
         list.clear()
+        sel = null
         shown = false
         edit = false
+        KeyWatch.stop()
     }
 
     fun reload() {
@@ -417,28 +740,54 @@ class KeyLayer(private val c: Context, private val wm: WindowManager, private va
     }
 
     fun vis(v: Boolean) {
+        val vv = if (v) View.VISIBLE else View.INVISIBLE
+        for (pv in list) { pv.hold?.visibility = vv; pv.mark?.visibility = vv }
+        bar?.visibility = vv
+    }
+
+    fun isAttached(): Boolean {
         for (pv in list) {
-            pv.hold?.visibility = if (v) View.VISIBLE else View.INVISIBLE
-            pv.mark?.visibility = if (v) View.VISIBLE else View.INVISIBLE
+            val a = pv.mark
+            if (a != null && !a.isAttachedToWindow) return false
         }
+        return true
     }
 
     fun setEdit(b: Boolean) {
         edit = b
         for (pv in list) {
-            pv.on = false
-            pv.job.setRunning(false)
-            val ml = pv.mlp
-            val k = pv.mark
-            if (ml != null && k != null) {
-                ml.flags = if (b) base else base or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
-                ml.alpha = if (b) 0.95f else 0.55f
-                try { wm.updateViewLayout(k, ml) } catch (e: Exception) { }
-            }
-            paint(pv)
+            setOn(pv, false)
+            applyMarkFlags(pv)
+        }
+        if (b) {
+            if (sel == null) sel = list.firstOrNull()
+            openBar()
+        } else {
+            closeBar()
+        }
+        paintAll()
+        onEditChange?.invoke()
+    }
+
+    // ---------- pemicu volume ----------
+    private fun updateWatch() {
+        if (list.any { it.m.trig != 0 }) {
+            KeyWatch.start { code, down -> mh.post { onKey(code, down) } }
+        } else {
+            KeyWatch.stop()
         }
     }
 
+    private fun onKey(code: String, down: Boolean) {
+        if (edit) return
+        val want = if (code == "VD") 1 else 2
+        for (pv in list) {
+            if (pv.m.trig != want) continue
+            if (pv.m.mode == 0) setOn(pv, down) else if (down) setOn(pv, !pv.on)
+        }
+    }
+
+    // ---------- tombol ----------
     private fun place(lp: WindowManager.LayoutParams?, fx: Int, fy: Int, size: Int, dm: DisplayMetrics) {
         if (lp == null) return
         lp.x = (fx / 1000f * dm.widthPixels - size / 2f).toInt()
@@ -451,53 +800,88 @@ class KeyLayer(private val c: Context, private val wm: WindowManager, private va
         return lp
     }
 
-    private fun build(pv: PV) {
+    private fun markFlags(): Int = if (edit) base else base or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+
+    private fun applyMarkFlags(pv: PV) {
+        val ml = pv.mlp
+        val k = pv.mark
+        if (ml != null && k != null) {
+            ml.flags = markFlags()
+            ml.alpha = if (edit) 0.95f else 0.55f
+            try { wm.updateViewLayout(k, ml) } catch (e: Exception) { }
+        }
+    }
+
+    private fun addHold(pv: PV) {
+        if (pv.hold != null) return
         try {
             val dm = scr()
             val h = c.label(pv.m.name, 20f, Color.WHITE, true, true)
             h.gravity = Gravity.CENTER
+            val hl = newLp(hs, base)
+            place(hl, pv.m.hx, pv.m.hy, hs, dm)
+            pv.hold = h; pv.hlp = hl
+            h.setOnTouchListener(touch(pv, true))
+            paint(pv)
+            wm.addView(h, hl)
+        } catch (e: Exception) { pv.hold = null; pv.hlp = null }
+    }
+
+    private fun removeHold(pv: PV) {
+        try { pv.hold?.let { wm.removeViewImmediate(it) } } catch (e: Exception) { }
+        pv.hold = null
+        pv.hlp = null
+    }
+
+    private fun build(pv: PV) {
+        try {
+            val dm = scr()
             val k = c.label(pv.m.name, 13f, Color.WHITE, true)
             k.gravity = Gravity.CENTER
-            val hl = newLp(hs, base)
-            val ml = newLp(ms, base or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE)
-            ml.alpha = 0.55f
-            place(hl, pv.m.hx, pv.m.hy, hs, dm)
+            val ml = newLp(ms, markFlags())
+            ml.alpha = if (edit) 0.95f else 0.55f
             place(ml, pv.m.tx, pv.m.ty, ms, dm)
-            pv.hold = h; pv.mark = k; pv.hlp = hl; pv.mlp = ml
-            paint(pv)
-            h.setOnTouchListener(touch(pv, true))
+            pv.mark = k; pv.mlp = ml
             k.setOnTouchListener(touch(pv, false))
-            wm.addView(h, hl)
+            paint(pv)
             wm.addView(k, ml)
         } catch (e: Exception) { }
+        if (pv.m.trig == 0) addHold(pv)
     }
 
     private fun paint(pv: PV) {
+        val chosen = edit && pv === sel
         val g = GradientDrawable()
         g.shape = GradientDrawable.OVAL
         g.setColor(if (edit) 0xCCFFB300.toInt() else if (pv.on) 0xCC00E5FF.toInt() else 0xB3FF1744.toInt())
-        g.setStroke(c.dp(2), Color.WHITE)
+        g.setStroke(c.dp(if (chosen) 4 else 2), Color.WHITE)
         pv.hold?.background = g
         val g2 = GradientDrawable()
         g2.shape = GradientDrawable.OVAL
-        g2.setColor(0x33000000)
-        g2.setStroke(c.dp(3), if (edit) 0xFFFFB300.toInt() else 0xFF00E5FF.toInt())
+        g2.setColor(if (pv.on) 0x6600E5FF else 0x33000000)
+        g2.setStroke(c.dp(3), if (chosen) Color.WHITE else if (edit) 0xFFFFB300.toInt() else 0xFF00E5FF.toInt())
         pv.mark?.background = g2
     }
 
+    private fun paintAll() { for (pv in list) paint(pv) }
+
+    private fun persist() { Km.save(c, list.map { it.m }) }
+
+    // ---------- mesin ketuk ----------
     private fun setOn(pv: PV, b: Boolean) {
+        if (b == pv.on && b) return
         pv.on = b
         paint(pv)
         if (b) {
+            if (!Shz.ready()) { toast("Ketukan otomatis butuh Shizuku. Buka aplikasi ELAINA > tab AKTIVASI."); pv.on = false; paint(pv); return }
             val dm = scr()
-            pv.job.x = (pv.m.tx / 1000f * dm.widthPixels).toInt()
-            pv.job.y = (pv.m.ty / 1000f * dm.heightPixels).toInt()
-            pv.job.cps = Km.CPS[pv.m.spd.coerceIn(0, 3)]
+            val x = (pv.m.tx / 1000f * dm.widthPixels).toInt()
+            val y = (pv.m.ty / 1000f * dm.heightPixels).toInt()
+            Tap.start(pv.id, x, y, Km.CPS[pv.m.spd.coerceIn(0, 3)])
+        } else {
+            Tap.stop(pv.id)
         }
-        pv.job.setRunning(b)
     }
-
-    private fun persist() { Km.save(c, list.map { it.m }) }
 
     private fun touch(pv: PV, isHold: Boolean): View.OnTouchListener {
         var sx = 0f
@@ -509,7 +893,10 @@ class KeyLayer(private val c: Context, private val wm: WindowManager, private va
             if (lp == null) false
             else if (edit) {
                 when (e.action) {
-                    MotionEvent.ACTION_DOWN -> { sx = e.rawX; sy = e.rawY; ox = lp.x; oy = lp.y }
+                    MotionEvent.ACTION_DOWN -> {
+                        sx = e.rawX; sy = e.rawY; ox = lp.x; oy = lp.y
+                        if (sel !== pv) { sel = pv; paintAll(); refreshBar() }
+                    }
                     MotionEvent.ACTION_MOVE -> {
                         lp.x = ox + (e.rawX - sx).toInt()
                         lp.y = oy + (e.rawY - sy).toInt()
@@ -534,6 +921,135 @@ class KeyLayer(private val c: Context, private val wm: WindowManager, private va
             } else false
         }
     }
+
+    // ---------- editor ----------
+    private fun chipsRow(items: List<String>, get: () -> Int, set: (Int) -> Unit): View {
+        val row = LinearLayout(c)
+        val tv = ArrayList<TextView>()
+        val paint = {
+            for (k in tv.indices) {
+                val on = get() == k
+                tv[k].setTextColor(if (on) Color.WHITE else C.MUTE)
+                tv[k].background = if (on) Chamfer(C.RED, 0, c.dp(6).toFloat(), 0f) else Chamfer(C.PANEL2, C.LINE, c.dp(6).toFloat())
+            }
+        }
+        for (k in items.indices) {
+            val t = c.label(items[k], 12f, C.MUTE, true)
+            t.gravity = Gravity.CENTER
+            t.setPadding(c.dp(6), c.dp(9), c.dp(6), c.dp(9))
+            t.setOnClickListener { set(k); paint() }
+            tv.add(t)
+            row.addView(t, c.lp(0, -2, 0, 1f).also { it.setMargins(c.dp(2), 0, c.dp(2), 0) })
+        }
+        painters.add(paint)
+        paint()
+        return row
+    }
+
+    private fun refreshBar() {
+        val p = sel
+        selT?.text = if (p != null) "Tombol terpilih: " + p.m.name else "Belum ada tombol. Ketuk + TAMBAH."
+        for (f in painters) f()
+    }
+
+    private fun openBar() {
+        if (bar != null) return
+        val b = LinearLayout(c)
+        b.orientation = LinearLayout.VERTICAL
+        b.setPadding(c.dp(10), c.dp(10), c.dp(10), c.dp(10))
+        b.background = Chamfer(0xF2101018.toInt(), C.RED, c.dp(12).toFloat(), 3f)
+        b.addView(c.label("EDIT KEYMAP", 16f, Color.WHITE, true, true))
+        b.addView(c.label("Seret tombol untuk memindah. Ketuk tombol untuk memilih lalu atur di bawah.", 10f, C.MUTE))
+        val st = c.label("", 13f, C.CYAN, true)
+        selT = st
+        b.addView(st, c.lp(-1, -2, 6))
+        b.addView(c.label("Pemicu (apa yang kamu tekan)", 11f, C.MUTE), c.lp(-1, -2, 4))
+        b.addView(chipsRow(Km.TRIG, { sel?.m?.trig ?: 0 }) { v -> setTrig(v) }, c.lp(-1, -2, 2))
+        b.addView(c.label("Cara kerja", 11f, C.MUTE), c.lp(-1, -2, 6))
+        b.addView(chipsRow(listOf("Tahan", "Kunci"), { sel?.m?.mode ?: 0 }) { v -> sel?.m?.mode = v; persist() }, c.lp(-1, -2, 2))
+        b.addView(c.label("Kecepatan ketuk", 11f, C.MUTE), c.lp(-1, -2, 6))
+        b.addView(chipsRow(Km.SPD, { sel?.m?.spd ?: 2 }) { v -> sel?.m?.spd = v; persist() }, c.lp(-1, -2, 2))
+        val act = LinearLayout(c)
+        val add = c.rogBtn("+ TAMBAH", false) { addItem() }
+        val del = c.rogBtn("HAPUS", false) { removeSel() }
+        val done = c.rogBtn("SELESAI", true) { setEdit(false) }
+        add.textSize = 12f; del.textSize = 12f; done.textSize = 12f
+        act.addView(add, c.lp(0, -2, 0, 1f).also { it.rightMargin = c.dp(3) })
+        act.addView(del, c.lp(0, -2, 0, 1f).also { it.setMargins(c.dp(3), 0, c.dp(3), 0) })
+        act.addView(done, c.lp(0, -2, 0, 1f).also { it.leftMargin = c.dp(3) })
+        b.addView(act, c.lp(-1, -2, 10))
+        val mv = c.rogBtn("PINDAH MENU INI KE ATAS / BAWAH", false) {
+            barTop = !barTop
+            val lp = barLp
+            val v = bar
+            if (lp != null && v != null) {
+                lp.gravity = (if (barTop) Gravity.TOP else Gravity.BOTTOM) or Gravity.CENTER_HORIZONTAL
+                try { wm.updateViewLayout(v, lp) } catch (e: Exception) { }
+            }
+        }
+        mv.textSize = 10f
+        b.addView(mv, c.lp(-1, -2, 6))
+        val dm = scr()
+        val w = minOf(dm.widthPixels - c.dp(16), c.dp(340))
+        val lp = WindowManager.LayoutParams(w, WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            PixelFormat.TRANSLUCENT)
+        lp.gravity = (if (barTop) Gravity.TOP else Gravity.BOTTOM) or Gravity.CENTER_HORIZONTAL
+        lp.y = c.dp(8)
+        try { wm.addView(b, lp) } catch (e: Exception) { return }
+        bar = b
+        barLp = lp
+        refreshBar()
+    }
+
+    private fun setTrig(v: Int) {
+        val pv = sel ?: return
+        pv.m.trig = v
+        if (v == 0) addHold(pv) else removeHold(pv)
+        paintAll()
+        persist()
+        updateWatch()
+        if (v != 0) toast("Pemicu tombol volume butuh Shizuku. Tekan tombol volume untuk memicu titik biru.")
+    }
+
+    private fun closeBar() {
+        try { bar?.let { wm.removeViewImmediate(it) } } catch (e: Exception) { }
+        bar = null
+        barLp = null
+        selT = null
+        painters.clear()
+    }
+
+    private fun addItem() {
+        if (list.size >= 6) { toast("Maksimal 6 tombol."); return }
+        val pv = PV(Km.newItem(list.size), nextId++)
+        build(pv)
+        list.add(pv)
+        sel = pv
+        persist()
+        paintAll()
+        refreshBar()
+    }
+
+    private fun removeSel() {
+        val pv = sel ?: return
+        Tap.stop(pv.id)
+        removeHold(pv)
+        try { pv.mark?.let { wm.removeViewImmediate(it) } } catch (e: Exception) { }
+        list.remove(pv)
+        for (i in list.indices) {
+            val n = "ABCDEF"[i.coerceIn(0, 5)].toString()
+            list[i].m.name = n
+            list[i].hold?.text = n
+            list[i].mark?.text = n
+        }
+        sel = list.lastOrNull()
+        persist()
+        paintAll()
+        refreshBar()
+        updateWatch()
+    }
 }
 __XH_EOF__
 mkdir -p "app/src/main/java/com/crosshair/pro"
@@ -544,6 +1060,9 @@ import android.Manifest
 import android.app.Activity
 import android.app.AlertDialog
 import android.app.NotificationManager
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.content.Intent
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
@@ -580,6 +1099,7 @@ class MainActivity : Activity() {
     private var tab = 0
     private var allApps: List<Game> = emptyList()
     private var preview: CrosshairView? = null
+    private var preview2: CrosshairView? = null
     private var pick: PickView? = null
     private var pending: String? = null
     private val ex = Executors.newSingleThreadExecutor()
@@ -600,9 +1120,9 @@ class MainActivity : Activity() {
         root.addView(content, LinearLayout.LayoutParams(-1, 0, 1f))
         navRow = LinearLayout(this)
         navRow.setBackgroundColor(C.PANEL)
-        val names = listOf("TURBO", "CROSSHAIR", "KEYMAP", "MONITOR", "SETELAN")
+        val names = listOf("TURBO", "CROSS", "KEYMAP", "OPTIMASI", "AKTIVASI", "INFO")
         for (i in names.indices) {
-            val t = label(names[i], 12f, C.MUTE, true)
+            val t = label(names[i], 10f, C.MUTE, true)
             t.gravity = Gravity.CENTER
             t.setPadding(0, dp(16), 0, dp(16))
             t.setOnClickListener { showTab(i) }
@@ -619,7 +1139,7 @@ class MainActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
-        if (tab == 0 || tab == 2 || tab == 4) showTab(tab)
+        if (tab == 0 || tab == 3 || tab == 4 || tab == 5) showTab(tab)
     }
 
     override fun onPause() {
@@ -633,6 +1153,12 @@ class MainActivity : Activity() {
     }
 
     private fun toast(t: String) { Toast.makeText(this, t, Toast.LENGTH_LONG).show() }
+
+    private fun copyText(t: String) {
+        val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        cm.setPrimaryClip(ClipData.newPlainText("ELAINA", t))
+        toast("Disalin ke papan klip.")
+    }
 
     private fun showTab(i: Int) {
         tab = i
@@ -652,55 +1178,90 @@ class MainActivity : Activity() {
             0 -> buildTurbo(col)
             1 -> buildCross(col)
             2 -> buildKeymap(col)
-            3 -> buildMonitor(col)
-            else -> buildSettings(col)
+            3 -> buildOptim(col)
+            4 -> buildActivation(col)
+            else -> buildInfo(col)
         }
         sv.addView(col)
         content.removeAllViews()
         content.addView(sv)
     }
 
-    private fun header(col: LinearLayout, sub: String) {
-        val row = LinearLayout(this)
-        row.gravity = Gravity.CENTER_VERTICAL
-        val av = ShapeImageView(this, s)
-        av.setImageResource(R.drawable.elaina)
-        row.addView(av, LinearLayout.LayoutParams(dp(60), dp(60)))
-        val tc = LinearLayout(this)
-        tc.orientation = LinearLayout.VERTICAL
-        tc.setPadding(dp(12), 0, 0, 0)
-        val t1 = label("ELAINA", 30f, Color.WHITE, true, true)
-        t1.setShadowLayer(14f, 0f, 0f, C.RED)
-        tc.addView(t1)
-        tc.addView(label(sub, 12f, C.RED, true))
-        row.addView(tc)
-        col.addView(row)
+    private fun apply() {
+        preview?.invalidate()
+        preview2?.invalidate()
+        OverlayService.instance?.refresh()
     }
 
-    private fun tile(title: String, value: String): LinearLayout {
-        val c = card(10)
-        c.addView(label(title, 11f, C.MUTE, true))
-        c.addView(label(value, 20f, Color.WHITE, true, true))
-        return c
+    private fun pickRow(items: List<String>, sel: Int, onSel: (Int) -> Unit): View {
+        val hs = HorizontalScrollView(this)
+        hs.isHorizontalScrollBarEnabled = false
+        val row = LinearLayout(this)
+        val chips = ArrayList<TextView>()
+        var cur = sel
+        val paint = {
+            for (k in chips.indices) {
+                val on = k == cur
+                chips[k].setTextColor(if (on) Color.WHITE else C.MUTE)
+                chips[k].background = if (on) Chamfer(C.RED, 0, dp(8).toFloat(), 0f) else Chamfer(C.PANEL2, C.LINE, dp(8).toFloat())
+            }
+        }
+        for (k in items.indices) {
+            val t = label(items[k], 14f, C.MUTE, true)
+            t.setPadding(dp(16), dp(10), dp(16), dp(10))
+            t.setOnClickListener { cur = k; paint(); onSel(k) }
+            chips.add(t)
+            row.addView(t, LinearLayout.LayoutParams(-2, -2).also { it.rightMargin = dp(8) })
+        }
+        paint()
+        hs.addView(row)
+        return hs
+    }
+
+    private fun seekPlus(name: String, key: String, lo: Int, hi: Int, step: Int, quick: List<Int>): View {
+        val col = LinearLayout(this)
+        col.orientation = LinearLayout.VERTICAL
+        val tv = label("", 13f, C.TEXT, true)
+        fun upd() { tv.text = name + ":  " + s.i(key) }
+        upd()
+        val sb = SeekBar(this)
+        sb.max = hi - lo
+        sb.progress = (s.i(key) - lo).coerceIn(0, hi - lo)
+        sb.progressTintList = ColorStateList.valueOf(C.RED)
+        sb.thumbTintList = ColorStateList.valueOf(C.RED)
+        sb.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(bar: SeekBar?, p: Int, user: Boolean) { s.set(key, p + lo); upd(); apply() }
+            override fun onStartTrackingTouch(bar: SeekBar?) {}
+            override fun onStopTrackingTouch(bar: SeekBar?) {}
+        })
+        col.addView(tv)
+        col.addView(sb)
+        val row = LinearLayout(this)
+        row.addView(rogBtn("-", false) { sb.progress = (sb.progress - step).coerceIn(0, hi - lo) }, lp(0, -2, 0, 1f).also { it.rightMargin = dp(4) })
+        row.addView(rogBtn("+", false) { sb.progress = (sb.progress + step).coerceIn(0, hi - lo) }, lp(0, -2, 0, 1f).also { it.setMargins(dp(4), 0, dp(4), 0) })
+        for (q in quick) row.addView(rogBtn("" + q, false) { sb.progress = (q - lo).coerceIn(0, hi - lo) }, lp(0, -2, 0, 1f).also { it.leftMargin = dp(4) })
+        col.addView(row, lp(-1, -2, 4))
+        return col
+    }
+
+    private fun statusRow(col: LinearLayout, text: String, ok: Boolean, btn: String?, action: (() -> Unit)?) {
+        val c = card(12)
+        c.addView(label((if (ok) "[OK]  " else "[BELUM]  ") + text, 14f, if (ok) C.GREEN else C.RED, true))
+        if (!ok && btn != null && action != null) c.addView(rogBtn(btn, true) { action() }, lp(-1, -2, 8))
+        col.addView(c, lp(-1, -2, 8))
     }
 
     // ================= TURBO =================
     private fun buildTurbo(col: LinearLayout) {
         header(col, "OPTIMASI  •  GAME TURBO")
-        val (_, _, rp) = Stats.ram(this)
-        val (bp, bt) = Stats.battery(this)
-        val st = LinearLayout(this)
-        st.addView(tile("RAM", "$rp%"), lp(0, -2, 0, 1f).also { it.setMargins(0, 0, dp(4), 0) })
-        st.addView(tile("BATERAI", "$bp%"), lp(0, -2, 0, 1f).also { it.setMargins(dp(4), 0, dp(4), 0) })
-        st.addView(tile("SUHU", "%.0f°C".format(bt)), lp(0, -2, 0, 1f).also { it.setMargins(dp(4), 0, 0, 0) })
-        col.addView(st, lp(-1, -2, 16))
-
         val on = OverlayService.instance != null
         val ac = card()
         ac.addView(label(if (on) "GAME TURBO AKTIF" else "GAME TURBO SIAP", 16f, if (on) C.GREEN else C.CYAN, true, true))
-        ac.addView(label(if (on) "Crosshair dan panel sedang berjalan di atas game." else "Pilih game lalu tekan START. Crosshair dan panel muncul otomatis.", 12f, C.MUTE))
+        ac.addView(label(if (on) "Crosshair dan menu sedang berjalan di atas game." else "Pilih game lalu tekan START. Crosshair dan menu muncul otomatis.", 12f, C.MUTE))
         if (on) ac.addView(rogBtn("MATIKAN", false) { stopService(Intent(this, OverlayService::class.java)); hd.postDelayed({ showTab(0) }, 300) }, lp(-1, -2, 10))
         col.addView(ac, lp(-1, -2, 14))
+        col.addView(label(if (Shz.ready()) "Shizuku: TERHUBUNG" else "Shizuku belum aktif. Fitur dasar tetap jalan. Lihat tab AKTIVASI.", 12f, if (Shz.ready()) C.GREEN else C.MUTE, true), lp(-1, -2, 8))
+        buildLive(col)
 
         col.addView(section("GAME KAMU"), lp(-2, -2, 22))
         val pins = s.pins()
@@ -729,7 +1290,66 @@ class MainActivity : Activity() {
         }
         col.addView(rogBtn("+ TAMBAH GAME", false) { pickGames() }, lp(-1, -2, 14))
         col.addView(label("Tahan lama pada game untuk menghapus yang kamu tambahkan sendiri.", 11f, C.MUTE), lp(-1, -2, 8))
-        buildOpt(col)
+    }
+
+    private fun buildLive(col: LinearLayout) {
+        col.addView(section("PANTAU PERANGKAT"), lp(-2, -2, 18))
+        val ramT = label("", 13f, C.TEXT, true)
+        val ramB = Bar(this)
+        val batT = label("", 13f, C.TEXT, true)
+        val batB = Bar(this)
+        val cpuT = label("", 13f, C.TEXT, true)
+        val pingT = label("PING: mengukur...", 13f, C.TEXT, true)
+        val c1 = card()
+        c1.addView(ramT)
+        c1.addView(ramB, LinearLayout.LayoutParams(-1, dp(8)).also { it.topMargin = dp(6) })
+        c1.addView(batT, lp(-1, -2, 10))
+        c1.addView(batB, LinearLayout.LayoutParams(-1, dp(8)).also { it.topMargin = dp(6) })
+        c1.addView(cpuT, lp(-1, -2, 10))
+        c1.addView(pingT, lp(-1, -2, 4))
+        col.addView(c1, lp(-1, -2, 10))
+        var n = 0
+        val r = object : Runnable {
+            override fun run() {
+                val (u, t, p) = Stats.ram(this@MainActivity)
+                ramT.text = "RAM:  $u / $t MB  ($p%)"; ramB.pct = p; ramB.invalidate()
+                val (bp, bt) = Stats.battery(this@MainActivity)
+                batT.text = "BATERAI:  $bp%  •  " + "%.1f".format(bt) + "°C  •  " + Stats.thermal(this@MainActivity)
+                batB.pct = bp; batB.col = C.GREEN; batB.invalidate()
+                Stats.pollCpu()
+                cpuT.text = "CPU:  " + Stats.cpu()
+                n++
+                if (n % 2 == 1) Stats.ping { ms -> pingT.text = if (ms < 0) "PING:  tidak terhubung" else "PING:  $ms ms" }
+                hd.postDelayed(this, 2000)
+            }
+        }
+        monitor = r
+        r.run()
+    }
+
+    // ================= UMUM =================
+    private fun header(col: LinearLayout, sub: String) {
+        val row = LinearLayout(this)
+        row.gravity = Gravity.CENTER_VERTICAL
+        val av = ShapeImageView(this, s)
+        av.setImageResource(R.drawable.elaina)
+        row.addView(av, LinearLayout.LayoutParams(dp(60), dp(60)))
+        val tc = LinearLayout(this)
+        tc.orientation = LinearLayout.VERTICAL
+        tc.setPadding(dp(12), 0, 0, 0)
+        val t1 = label("ELAINA", 30f, Color.WHITE, true, true)
+        t1.setShadowLayer(14f, 0f, 0f, C.RED)
+        tc.addView(t1)
+        tc.addView(label(sub, 12f, C.RED, true))
+        row.addView(tc)
+        col.addView(row)
+    }
+
+    private fun tile(title: String, value: String): LinearLayout {
+        val c = card(10)
+        c.addView(label(title, 11f, C.MUTE, true))
+        c.addView(label(value, 20f, Color.WHITE, true, true))
+        return c
     }
 
     private fun isGame(ai: ApplicationInfo): Boolean {
@@ -800,7 +1420,7 @@ class MainActivity : Activity() {
         hd.postDelayed({
             val li = if (pkg != null) packageManager.getLaunchIntentForPackage(pkg) else null
             if (li != null) startActivity(li) else toast("Game tidak bisa dibuka.")
-        }, 600)
+        }, if (s.i("res") > 0) 1800 else 600)
     }
 
     @Deprecated("Deprecated in Java")
@@ -811,21 +1431,50 @@ class MainActivity : Activity() {
         if (rc == 77) launchGame(pending, if (res == RESULT_OK) d else null, res)
     }
 
-    // ================= CROSSHAIR =================
-    private fun apply() {
-        preview?.invalidate()
-        OverlayService.instance?.refresh()
-    }
 
-    private fun buildCross(col: LinearLayout) {
-        header(col, "EDITOR CROSSHAIR")
+    // ================= CROSSHAIR =================
+    private fun photoBox(col: LinearLayout, h: Int, second: Boolean) {
         val box = FrameLayout(this)
         box.background = Chamfer(0xFF1A0B33.toInt(), C.RED, dp(14).toFloat(), 3f)
         val pv = CrosshairView(this, s)
         pv.photo = Store.cut(this)
-        preview = pv
+        if (second) preview2 = pv else preview = pv
         box.addView(pv, FrameLayout.LayoutParams(-1, -1))
-        col.addView(box, lp(-1, dp(220), 14))
+        col.addView(box, lp(-1, dp(h), if (second) 10 else 14))
+    }
+
+    private fun dpad(): View {
+        val col = LinearLayout(this)
+        col.orientation = LinearLayout.VERTICAL
+        val tv = label("", 13f, C.TEXT, true)
+        fun upd() { tv.text = "Posisi foto:  X " + s.i("pDx") + "   Y " + s.i("pDy") }
+        upd()
+        fun nudge(dx: Int, dy: Int) {
+            s.set("pDx", (s.i("pDx") + dx).coerceIn(-140, 140))
+            s.set("pDy", (s.i("pDy") + dy).coerceIn(-140, 140))
+            upd(); apply()
+        }
+        fun cell(t: String?, a: (() -> Unit)?): View {
+            if (t == null || a == null) return View(this)
+            return rogBtn(t, false) { a() }
+        }
+        val rows = listOf(
+            listOf(cell(null, null), cell("^", { nudge(0, -4) }), cell(null, null)),
+            listOf(cell("<", { nudge(-4, 0) }), cell("RESET", { s.set("pDx", 0); s.set("pDy", 0); upd(); apply() }), cell(">", { nudge(4, 0) })),
+            listOf(cell(null, null), cell("v", { nudge(0, 4) }), cell(null, null))
+        )
+        col.addView(tv)
+        for (r in rows) {
+            val row = LinearLayout(this)
+            for (v in r) row.addView(v, lp(0, -2, 0, 1f).also { it.setMargins(dp(3), dp(3), dp(3), dp(3)) })
+            col.addView(row, lp(-1, -2, 2))
+        }
+        return col
+    }
+
+    private fun buildCross(col: LinearLayout) {
+        header(col, "EDITOR CROSSHAIR")
+        photoBox(col, 220, false)
 
         col.addView(section("BENTUK"), lp(-2, -2, 20))
         col.addView(label("Pilih satu atau lebih bentuk lalu gabungkan sesukamu.", 12f, C.MUTE), lp(-1, -2, 6))
@@ -864,16 +1513,268 @@ class MainActivity : Activity() {
         col.addView(chipRow("mode", listOf("Dari tepi", "Seluruh gambar"), true, null), lp(-1, -2, 10))
         col.addView(seek("Toleransi warna", "tol", 5, 150, true), lp(-1, -2, 8))
         col.addView(seek("Haluskan tepi", "feather", 0, 6, true), lp(-1, -2, 6))
-        col.addView(seek("Ukuran foto", "pSize", 10, 280, false), lp(-1, -2, 6))
-        col.addView(seek("Transparansi foto", "pOp", 10, 100, false), lp(-1, -2, 6))
-        col.addView(label("Bentuk foto crosshair", 12f, C.MUTE), lp(-1, -2, 10))
+
+        col.addView(section("EDIT FOTO"), lp(-2, -2, 24))
+        col.addView(label("Pratinjau langsung. Atur ukuran, putaran, dan posisi foto di bawah ini.", 12f, C.MUTE), lp(-1, -2, 6))
+        photoBox(col, 200, true)
+        col.addView(seekPlus("Ukuran foto", "pSize", 10, 280, 5, listOf()), lp(-1, -2, 12))
+        col.addView(seekPlus("Putar foto (derajat)", "pRot", 0, 360, 15, listOf(0, 90, 180, 270)), lp(-1, -2, 12))
+        col.addView(label("Geser posisi foto", 12f, C.MUTE), lp(-1, -2, 12))
+        col.addView(dpad(), lp(-1, -2, 4))
+        col.addView(seek("Transparansi foto", "pOp", 10, 100, false), lp(-1, -2, 12))
+        col.addView(label("Bentuk foto crosshair", 12f, C.MUTE), lp(-1, -2, 12))
         col.addView(chipRow("pShape", listOf("Kotak", "Bulat"), false, null), lp(-1, -2, 6))
         col.addView(check("Bingkai cincin (untuk foto bulat)", "pRing"))
         col.addView(check("Pakai foto sebagai crosshair", "usePhoto"))
         col.addView(check("Satu warna (siluet)", "tint"))
+        col.addView(rogBtn("RESET UKURAN, PUTARAN, POSISI FOTO", false) {
+            s.set("pSize", 70); s.set("pRot", 0); s.set("pDx", 0); s.set("pDy", 0); s.set("pOp", 100)
+            apply()
+            showTab(1)
+        }, lp(-1, -2, 12))
         if (File(filesDir, "src.png").exists()) reprocess()
     }
 
+    // ================= KEYMAP =================
+    private fun kmSync() { OverlayService.instance?.kmReload() }
+
+    private fun runTest(pad: PadView) {
+        if (!Shz.ready()) { toast("Nyalakan Shizuku dulu (tab AKTIVASI)."); return }
+        val loc = IntArray(2)
+        pad.getLocationOnScreen(loc)
+        val x = loc[0] + pad.width / 2
+        val y = loc[1] + pad.height / 2
+        pad.reset()
+        pad.msg = "Mengetes 3 detik..."
+        pad.invalidate()
+        val app = applicationContext
+        val eng = s.i("kmEng")
+        Thread {
+            val ok = Tap.ensure(app, eng)
+            if (ok) {
+                Tap.start(99, x, y, 0)
+                try { Thread.sleep(3000) } catch (e: Exception) { }
+                Tap.stop(99)
+            }
+            try { Thread.sleep(400) } catch (e: Exception) { }
+            runOnUiThread {
+                val n = pad.count
+                pad.msg = if (!ok) "Gagal: " + Tap.label else "" + (n / 3) + " ketukan/detik  •  " + Tap.label
+                pad.invalidate()
+                if (ok && n == 0) toast("Ketukan terkirim tapi tidak masuk. Coba mesin lain di atas.")
+            }
+        }.start()
+    }
+
+    private fun buildKeymap(col: LinearLayout) {
+        header(col, "KEYMAP  •  KETUK OTOMATIS")
+        val ready = Shz.ready()
+        val st = card()
+        st.addView(label(if (ready) "SHIZUKU TERHUBUNG" else "KEYMAP BUTUH SHIZUKU", 15f, if (ready) C.GREEN else C.RED, true, true))
+        st.addView(label(if (ready) "Mesin ketuk: " + Tap.label else "Nyalakan Shizuku dulu di tab AKTIVASI.", 12f, C.MUTE))
+        if (!ready) st.addView(rogBtn("KE TAB AKTIVASI", true) { showTab(4) }, lp(-1, -2, 10))
+        if (Build.VERSION.SDK_INT < 34)
+            st.addView(label("Android " + Build.VERSION.RELEASE + ": pemicu lewat layar bisa memutus sentuhan jari lain (misalnya arah bidik). Pakai pemicu tombol VOLUME atau mode Kunci supaya aman.", 11f, C.RED), lp(-1, -2, 8))
+        col.addView(st, lp(-1, -2, 14))
+        col.addView(check("Tampilkan keymap saat Game Turbo menyala", "kmOn"), lp(-1, -2, 8))
+
+        col.addView(section("CARA KERJA"), lp(-2, -2, 18))
+        col.addView(label("Tiap tombol punya dua bagian:\n• PEMICU = yang kamu tekan: tombol bulat MERAH di layar, atau tombol VOLUME fisik.\n• LINGKARAN BIRU = titik di game yang diketuk otomatis (misalnya tombol tembak).\nTekan pemicu, titik biru diketuk cepat.", 12f, C.MUTE), lp(-1, -2, 8))
+        col.addView(section("LANGKAH (DI DALAM GAME)"), lp(-2, -2, 18))
+        col.addView(label("1. Tekan START di tab TURBO.\n2. Ketuk ikon Elaina > KEYMAP > EDIT TOMBOL.\n3. Ketuk + TAMBAH. Muncul tombol merah dan lingkaran biru.\n4. Seret lingkaran biru ke tombol game yang mau diketuk otomatis.\n5. Pilih pemicu: Layar (seret tombol merah ke tempat jarimu), Vol - atau Vol +.\n6. Pilih Tahan/Kunci dan kecepatan, lalu SELESAI.", 12f, C.MUTE), lp(-1, -2, 8))
+
+        col.addView(section("MESIN KETUK"), lp(-2, -2, 20))
+        col.addView(label("Otomatis memakai mesin CEPAT (injector) dan beralih ke STANDAR bila gagal. Kalau ketukan tidak masuk ke game, coba mesin lain lalu uji di papan bawah.", 12f, C.MUTE), lp(-1, -2, 8))
+        col.addView(chipRow("kmEng", listOf("Otomatis", "Cepat saja", "Standar saja"), false) { Thread { Tap.shutdown() }.start() }, lp(-1, -2, 8))
+        col.addView(section("UJI KECEPATAN"), lp(-2, -2, 20))
+        val pad = PadView(this)
+        col.addView(pad, lp(-1, dp(120), 8))
+        col.addView(rogBtn("TES 3 DETIK", true) { runTest(pad) }, lp(-1, -2, 8))
+        col.addView(label("Papan ini menghitung ketukan yang benar-benar masuk. Kalau angkanya 0, kirim screenshot papan ini.", 11f, C.MUTE), lp(-1, -2, 6))
+
+        col.addView(section("TOMBOL KAMU"), lp(-2, -2, 22))
+        col.addView(label("Posisi diatur di dalam game. Di sini kamu mengatur pemicu, cara kerja, dan kecepatan.", 11f, C.MUTE), lp(-1, -2, 6))
+        val list = Km.load(this)
+        if (list.isEmpty()) col.addView(label("Belum ada tombol. Ketuk TAMBAH TOMBOL atau tambah lewat menu di game.", 13f, C.MUTE), lp(-1, -2, 10))
+        for (idx in list.indices) {
+            val km = list[idx]
+            val c = card()
+            c.addView(label("TOMBOL " + km.name, 16f, Color.WHITE, true, true))
+            c.addView(label("Pemicu", 12f, C.MUTE), lp(-1, -2, 8))
+            c.addView(pickRow(Km.TRIG, km.trig) { km.trig = it; Km.save(this, list); kmSync() }, lp(-1, -2, 4))
+            c.addView(label("Cara kerja", 12f, C.MUTE), lp(-1, -2, 8))
+            c.addView(pickRow(listOf("Tahan", "Kunci"), km.mode) { km.mode = it; Km.save(this, list); kmSync() }, lp(-1, -2, 4))
+            c.addView(label("Kecepatan ketuk", 12f, C.MUTE), lp(-1, -2, 8))
+            c.addView(pickRow(Km.SPD, km.spd) { km.spd = it; Km.save(this, list); kmSync() }, lp(-1, -2, 4))
+            c.addView(rogBtn("HAPUS TOMBOL", false) {
+                list.removeAt(idx)
+                Km.rename(list)
+                Km.save(this, list)
+                kmSync()
+                showTab(2)
+            }, lp(-1, -2, 12))
+            col.addView(c, lp(-1, -2, 10))
+        }
+        col.addView(rogBtn("+ TAMBAH TOMBOL", true) {
+            if (list.size >= 6) toast("Maksimal 6 tombol.") else {
+                list.add(Km.newItem(list.size))
+                Km.save(this, list)
+                kmSync()
+                showTab(2)
+            }
+        }, lp(-1, -2, 14))
+        col.addView(label("Tahan = ketuk otomatis selama pemicu ditahan. Kunci = tekan sekali untuk mulai, tekan lagi untuk berhenti.\nBiasa sekitar 5 ketukan/detik, Sedang 10, Cepat 20, Gila secepat HP mampu (mesin CEPAT bisa 30 sampai 60).\nPemicu Vol - / Vol + membaca tombol volume fisik dan tetap mengubah volume suara.", 11f, C.MUTE), lp(-1, -2, 10))
+        col.addView(label("Banyak game online melarang auto-click. Pakai dengan risiko sendiri, paling aman di game offline.", 11f, C.RED), lp(-1, -2, 8))
+    }
+
+    // ================= OPTIMASI =================
+    private fun buildOptim(col: LinearLayout) {
+        header(col, "OPTIMASI & GRAFIK")
+        val ready = Shz.ready()
+        val st = card()
+        st.addView(label(if (ready) "SHIZUKU TERHUBUNG" else "SEBAGIAN BUTUH SHIZUKU", 15f, if (ready) C.GREEN else C.RED, true, true))
+        st.addView(label(if (ready) "Semua pengaturan di bawah aktif otomatis saat START dan dikembalikan saat Game Turbo dimatikan." else "Tanpa Shizuku, hanya animasi sistem yang bisa diatur dan itu butuh izin ADB sekali. Lainnya butuh Shizuku. Lihat tab AKTIVASI.", 12f, C.MUTE))
+        if (!ready) st.addView(rogBtn("KE TAB AKTIVASI", true) { showTab(4) }, lp(-1, -2, 10))
+        col.addView(st, lp(-1, -2, 14))
+
+        col.addView(section("PROFIL PERFORMA"), lp(-2, -2, 20))
+        col.addView(label("Normal = tanpa perubahan.\nSeimbang = bersihkan RAM, Game Mode, animasi cepat.\nPerforma = tambah refresh rate 120 Hz dan resolusi 90%.\nMaks = animasi mati, resolusi 80%, mode performa tetap.", 12f, C.MUTE), lp(-1, -2, 8))
+        col.addView(pickRow(listOf("Normal", "Seimbang", "Performa", "Maks"), s.i("perf")) { Opt.preset(s, it); showTab(3) }, lp(-1, -2, 8))
+
+        col.addView(section("GRAFIK"), lp(-2, -2, 22))
+        col.addView(label("Resolusi layar (lebih rendah = lebih ringan dan lebih halus, gambar sedikit lebih buram)", 12f, C.MUTE), lp(-1, -2, 6))
+        col.addView(pickRow(listOf("100%", "90%", "80%", "70%", "60%"), s.i("res")) { s.set("res", it) }, lp(-1, -2, 6))
+        col.addView(label("Animasi sistem", 12f, C.MUTE), lp(-1, -2, 12))
+        col.addView(pickRow(listOf("Normal", "Cepat", "Mati"), s.i("anim")) { s.set("anim", it) }, lp(-1, -2, 6))
+        col.addView(label("Refresh rate paksa (HP yang tidak mendukung akan mengabaikan)", 12f, C.MUTE), lp(-1, -2, 12))
+        col.addView(pickRow(listOf("Bawaan", "90 Hz", "120 Hz", "144 Hz"), s.i("hz")) { s.set("hz", it) }, lp(-1, -2, 6))
+        col.addView(check("Bersihkan RAM otomatis saat START", "autoClean"), lp(-1, -2, 12))
+        col.addView(check("Mode performa game (Game Mode)", "gmode"))
+        col.addView(check("Kunci mode performa tinggi (Android 12+)", "fperf"))
+
+        col.addView(section("TERAPKAN"), lp(-2, -2, 22))
+        col.addView(rogBtn("TERAPKAN SEKARANG", true) {
+            if (!ready && !Opt.secureOk(this)) toast("Butuh Shizuku. Lihat tab AKTIVASI.")
+            else {
+                val app = applicationContext
+                Thread { Opt.restore(app); Opt.apply(app, s, null); runOnUiThread { toast("Diterapkan.") } }.start()
+            }
+        }, lp(-1, -2, 8))
+        col.addView(rogBtn("BERSIHKAN RAM SEKARANG", false) { if (ready) Opt.clean(this) { toast(it) } else toast("Butuh Shizuku.") }, lp(-1, -2, 8))
+        col.addView(rogBtn("BERI IZIN OTOMATIS (Shizuku)", false) { if (ready) Opt.grantAll(this) { toast(it) } else toast("Butuh Shizuku.") }, lp(-1, -2, 8))
+        col.addView(rogBtn("PULIHKAN PENGATURAN SISTEM", false) {
+            val app = applicationContext
+            Thread { Opt.restore(app); runOnUiThread { toast("Pengaturan sistem dipulihkan.") } }.start()
+        }, lp(-1, -2, 8))
+        col.addView(label("Resolusi diubah sebelum game dibuka (game sempat memuat ulang). Kalau layar terlihat aneh, tekan PULIHKAN. Pengaturan juga kembali otomatis saat Game Turbo dimatikan.", 11f, C.RED), lp(-1, -2, 10))
+    }
+
+    // ================= AKTIVASI =================
+    private fun methodCard(col: LinearLayout, title: String, tag: String?, steps: String, build: (LinearLayout) -> Unit) {
+        val c = card()
+        c.addView(label(title + (if (tag != null) "   [" + tag + "]" else ""), 15f, Color.WHITE, true, true))
+        c.addView(label("CARA PAKAI", 11f, C.CYAN, true), lp(-1, -2, 8))
+        c.addView(label(steps, 12f, C.MUTE), lp(-1, -2, 4))
+        build(c)
+        col.addView(c, lp(-1, -2, 12))
+    }
+
+    private fun buildActivation(col: LinearLayout) {
+        header(col, "AKTIVASI SHIZUKU")
+        val alive = Shz.alive()
+        val ready = Shz.ready()
+        val st = card()
+        st.addView(label(if (ready) "TERHUBUNG" else if (alive) "SHIZUKU JALAN, IZIN BELUM" else "SHIZUKU BELUM AKTIF", 16f, if (ready) C.GREEN else C.RED, true, true))
+        st.addView(label("Shizuku adalah izin khusus yang membuka keymap, pembersih RAM, grafik, dan CPU persen. Fitur dasar (crosshair, menu, pantau) tetap jalan tanpa ini.", 12f, C.MUTE))
+        st.addView(label("Disarankan untuk HP kamu (Android " + Build.VERSION.RELEASE + "): " + (if (Build.VERSION.SDK_INT >= 30) "Metode 1 (Debugging Nirkabel)" else "Metode 2 (lewat komputer)"), 12f, C.CYAN, true), lp(-1, -2, 8))
+        st.addView(rogBtn("CEK STATUS", true) { showTab(4) }, lp(-1, -2, 10))
+        if (alive && !ready) st.addView(rogBtn("IZINKAN SHIZUKU", true) { Shz.request() }, lp(-1, -2, 8))
+        col.addView(st, lp(-1, -2, 14))
+
+        col.addView(section("PILIH METODE"), lp(-2, -2, 20))
+        methodCard(col, "1. Debugging Nirkabel", if (Build.VERSION.SDK_INT >= 30) "DISARANKAN" else "Android 11+",
+            "Tanpa komputer. Butuh Android 11 ke atas dan Wi-Fi.\n1. Pasang aplikasi Shizuku (Play Store atau GitHub RikkaApps/Shizuku).\n2. Sambungkan HP ke Wi-Fi.\n3. Pengaturan > Tentang ponsel > ketuk Nomor build 7 kali sampai mode pengembang aktif.\n4. Buka Opsi pengembang, nyalakan Debugging nirkabel (izinkan jaringan Wi-Fi ini).\n5. Buka Shizuku > Mulai lewat debugging nirkabel > Pairing. Ketuk pasangkan dengan kode, lalu masukkan kode dari notifikasi.\n6. Kembali ke Shizuku dan ketuk Mulai. Statusnya jadi sedang berjalan.\n7. Buka ELAINA dan ketuk IZINKAN SHIZUKU.\nSetelah HP restart, cukup ulangi langkah 6.") { c ->
+            c.addView(rogBtn("BUKA OPSI PENGEMBANG", false) {
+                try { startActivity(Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS)) } catch (e: Exception) { toast("Aktifkan mode pengembang lewat Tentang ponsel > Nomor build.") }
+            }, lp(-1, -2, 8))
+            c.addView(rogBtn("BUKA SHIZUKU", false) { openShizuku() }, lp(-1, -2, 8))
+            c.addView(rogBtn("IZINKAN SHIZUKU", true) { if (Shz.alive()) Shz.request() else toast("Shizuku belum berjalan. Nyalakan dulu di aplikasi Shizuku.") }, lp(-1, -2, 8))
+        }
+        methodCard(col, "2. Lewat komputer (kabel USB)", if (Build.VERSION.SDK_INT < 30) "DISARANKAN" else "Semua Android",
+            "Untuk Android 10 ke bawah atau kalau debugging nirkabel tidak ada.\n1. Pasang aplikasi Shizuku di HP.\n2. Nyalakan Debugging USB di Opsi pengembang.\n3. Sambungkan HP ke komputer dengan kabel dan izinkan debugging.\n4. Di komputer (sudah ada ADB/platform-tools) jalankan perintah di bawah.\n5. Tunggu tulisan shizuku_starter exit with 0.\n6. Buka ELAINA dan ketuk IZINKAN SHIZUKU.\nUlangi perintah setiap HP restart.") { c ->
+            c.addView(rogBtn("SALIN PERINTAH ADB", true) { copyText("adb shell sh /sdcard/Android/data/moe.shizuku.privileged.api/start.sh") }, lp(-1, -2, 8))
+            c.addView(rogBtn("IZINKAN SHIZUKU", false) { if (Shz.alive()) Shz.request() else toast("Shizuku belum berjalan.") }, lp(-1, -2, 8))
+        }
+        methodCard(col, "3. Root", "HP sudah root",
+            "1. Pasang aplikasi Shizuku.\n2. Buka Shizuku, ketuk Mulai (root).\n3. Izinkan akses root saat diminta.\n4. Buka ELAINA dan ketuk IZINKAN SHIZUKU.") { c ->
+            c.addView(rogBtn("BUKA SHIZUKU", false) { openShizuku() }, lp(-1, -2, 8))
+        }
+        val sec = Opt.secureOk(this)
+        methodCard(col, "4. HP tidak mendukung Shizuku", "tanpa Shizuku",
+            "Yang tetap jalan tanpa Shizuku: crosshair (semua bentuk dan foto), menu melayang, pantau RAM/baterai/ping, screenshot lewat rekam layar, mode fokus.\nYang butuh Shizuku: keymap, bersihkan RAM, resolusi/refresh rate, CPU persen.\nOpsi tanpa Shizuku (butuh komputer sekali): beri izin lewat ADB.\n1. Nyalakan Debugging USB dan sambungkan ke komputer.\n2. Jalankan perintah di bawah.\n3. Animasi sistem sekarang bisa dipercepat atau dimatikan saat game lewat tab OPTIMASI.\nIzin ini tetap ada sampai aplikasi dihapus.") { c ->
+            c.addView(label("Izin WRITE_SECURE_SETTINGS: " + (if (sec) "AKTIF" else "BELUM"), 12f, if (sec) C.GREEN else C.RED, true), lp(-1, -2, 8))
+            c.addView(rogBtn("SALIN PERINTAH ADB", true) { copyText("adb shell pm grant " + packageName + " android.permission.WRITE_SECURE_SETTINGS") }, lp(-1, -2, 8))
+        }
+        col.addView(label("Kalau Shizuku mati sendiri setelah HP restart atau lama tidak dipakai, ulangi langkah Mulai di aplikasi Shizuku.", 11f, C.MUTE), lp(-1, -2, 8))
+    }
+
+    // ================= INFO =================
+    private fun buildInfo(col: LinearLayout) {
+        header(col, "INFO & PENGATURAN")
+        col.addView(section("SIAP MAIN? PERIKSA DULU"), lp(-2, -2, 18))
+        statusRow(col, "Tampil di atas aplikasi lain", Settings.canDrawOverlays(this), "BERI IZIN") {
+            startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+        }
+        val pw = getSystemService(PowerManager::class.java)
+        statusRow(col, "Penghemat baterai dimatikan", pw.isIgnoringBatteryOptimizations(packageName), "MATIKAN PENGHEMAT BATERAI") {
+            try { startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName"))) }
+            catch (e: Exception) { toast("Buka Setelan > Baterai > ELAINA > Tanpa batasan.") }
+        }
+        val c1 = card(12)
+        c1.addView(label("Izin jendela pop-up di latar belakang", 14f, Color.WHITE, true))
+        c1.addView(label("Wajib untuk HP Xiaomi/Redmi/POCO supaya menu tidak hilang di dalam game. Di halaman yang terbuka: Izin lainnya > Tampilkan jendela pop-up saat berjalan di latar belakang > Izinkan. Aktifkan juga Mulai otomatis. HP merek lain biasanya cukup dengan izin di atas.", 12f, C.MUTE), lp(-1, -2, 4))
+        c1.addView(rogBtn("BUKA HALAMAN IZIN APLIKASI", true) {
+            startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$packageName")))
+        }, lp(-1, -2, 8))
+        col.addView(c1, lp(-1, -2, 8))
+        statusRow(col, "Shizuku terhubung (keymap, optimasi, CPU %)", Shz.ready(), "KE TAB AKTIVASI") { showTab(4) }
+        val nm = getSystemService(NotificationManager::class.java)
+        statusRow(col, "Jangan Ganggu untuk mode fokus (opsional)", nm.isNotificationPolicyAccessGranted, "BERI IZIN") {
+            startActivity(Intent(Settings.ACTION_NOTIFICATION_POLICY_ACCESS_SETTINGS))
+        }
+
+        col.addView(section("CARA MAIN"), lp(-2, -2, 22))
+        col.addView(label("1. Pastikan daftar di atas [OK].\n2. Tab TURBO: pilih game lalu tekan START.\n3. Di dalam game muncul crosshair dan ikon bulat Elaina.\n4. Ketuk ikon Elaina untuk membuka menu. Tahan lalu geser untuk memindahkan.\n5. Menu punya halaman: CROSSHAIR, KEYMAP, GRAFIK, ALAT, INFO. Tombol < kembali ke halaman utama.\n6. Mematikan: tombol BERHENTI di menu atau MATIKAN di notifikasi.", 12f, C.MUTE), lp(-1, -2, 8))
+        col.addView(section("MENU HILANG SENDIRI?"), lp(-2, -2, 22))
+        col.addView(label("Coba berurutan:\n1. Matikan penghemat baterai (daftar di atas).\n2. Xiaomi: izinkan jendela pop-up di latar belakang dan Mulai otomatis.\n3. Kunci ELAINA di layar Recent (tahan kartunya, pilih Kunci).\n4. Jangan geser ELAINA keluar dari Recent saat main.\n5. Dengan Shizuku: tab OPTIMASI > BERI IZIN OTOMATIS.\nMenu otomatis dipasang ulang bila sistem melepasnya. Sebagian game memang memblokir overlay.", 12f, C.MUTE), lp(-1, -2, 8))
+
+        col.addView(section("BENTUK GAMBAR"), lp(-2, -2, 24))
+        col.addView(label("Berlaku untuk semua gambar di aplikasi: foto profil, ikon game, dan lainnya.", 12f, C.MUTE), lp(-1, -2, 8))
+        col.addView(chipRow("imgShape", listOf("Lingkaran", "Kotak"), false) { showTab(5) }, lp(-1, -2, 10))
+        val av = ShapeImageView(this, s)
+        av.setImageResource(R.drawable.elaina)
+        col.addView(av, lp(dp(96), dp(96), 12))
+
+        col.addView(section("MODE FOKUS & SCREENSHOT"), lp(-2, -2, 24))
+        col.addView(check("Mode fokus (bungkam notifikasi saat main)", "focus"), lp(-1, -2, 8))
+        col.addView(check("Screenshot lewat rekam layar (tanpa Shizuku)", "shot"))
+        col.addView(section("MENU DI GAME"), lp(-2, -2, 24))
+        col.addView(rogBtn("RESET POSISI MENU", false) {
+            s.set("pX", 0); s.set("pY", 200)
+            OverlayService.instance?.moveTo()
+            toast("Posisi menu dikembalikan.")
+        }, lp(-1, -2, 8))
+        col.addView(rogBtn("RESET SEMUA PENGATURAN", false) {
+            s.reset()
+            File(filesDir, "cut.png").delete()
+            File(filesDir, "src.png").delete()
+            OverlayService.instance?.refresh()
+            showTab(5)
+        }, lp(-1, -2, 12))
+        col.addView(label("ELAINA Optimasi v3", 11f, C.MUTE), lp(-1, -2, 12))
+    }
+
+    // ================= PEMBANTU UI & FOTO =================
     private fun chipRow(key: String, items: List<String>, reproc: Boolean, after: (() -> Unit)?): View {
         val hs = HorizontalScrollView(this)
         hs.isHorizontalScrollBarEnabled = false
@@ -1018,203 +1919,6 @@ class MainActivity : Activity() {
         if (li != null) startActivity(li) else toast("Aplikasi Shizuku belum terpasang. Pasang dari Play Store atau GitHub Shizuku.")
     }
 
-    private fun buildOpt(col: LinearLayout) {
-        col.addView(section("OPTIMASI SHIZUKU"), lp(-2, -2, 26))
-        val alive = Shz.alive()
-        val ready = Shz.ready()
-        val st = card()
-        st.addView(label(if (ready) "SHIZUKU: TERHUBUNG" else if (alive) "SHIZUKU: BELUM DIIZINKAN" else "SHIZUKU: TIDAK AKTIF", 15f, if (ready) C.GREEN else C.RED, true, true))
-        st.addView(label("Crosshair, panel, dan monitor tetap jalan tanpa Shizuku. Fitur optimasi di bawah butuh Shizuku.", 12f, C.MUTE))
-        if (!ready) st.addView(rogBtn(if (alive) "IZINKAN SHIZUKU" else "BUKA SHIZUKU", true) { if (alive) Shz.request() else openShizuku() }, lp(-1, -2, 10))
-        col.addView(st, lp(-1, -2, 12))
-        if (ready) {
-            col.addView(check("Bersihkan RAM otomatis saat START", "autoClean"), lp(-1, -2, 8))
-            col.addView(check("Mode performa game (Game Mode)", "gmode"))
-            col.addView(label("Animasi sistem saat game", 12f, C.MUTE), lp(-1, -2, 8))
-            col.addView(chipRow("anim", listOf("Normal", "Cepat", "Mati"), false, null), lp(-1, -2, 6))
-            col.addView(label("Refresh rate paksa", 12f, C.MUTE), lp(-1, -2, 10))
-            col.addView(chipRow("hz", listOf("Bawaan", "90 Hz", "120 Hz", "144 Hz"), false, null), lp(-1, -2, 6))
-            col.addView(rogBtn("BERSIHKAN RAM SEKARANG", false) { Opt.clean(this) { toast(it) } }, lp(-1, -2, 12))
-            col.addView(rogBtn("BERI IZIN OTOMATIS", false) { Opt.grantAll(this) { toast(it) } }, lp(-1, -2, 8))
-            col.addView(rogBtn("PULIHKAN PENGATURAN SISTEM", false) {
-                val app = applicationContext
-                Thread { Opt.restore(app); runOnUiThread { toast("Pengaturan sistem dipulihkan.") } }.start()
-            }, lp(-1, -2, 8))
-            col.addView(label("Animasi dan refresh rate otomatis dikembalikan saat Game Turbo dimatikan.", 11f, C.MUTE), lp(-1, -2, 8))
-        }
-    }
-
-    // ================= KEYMAP =================
-    private fun pickRow(items: List<String>, sel: Int, onSel: (Int) -> Unit): View {
-        val hs = HorizontalScrollView(this)
-        hs.isHorizontalScrollBarEnabled = false
-        val row = LinearLayout(this)
-        val chips = ArrayList<TextView>()
-        var cur = sel
-        val paint = {
-            for (k in chips.indices) {
-                val on = k == cur
-                chips[k].setTextColor(if (on) Color.WHITE else C.MUTE)
-                chips[k].background = if (on) Chamfer(C.RED, 0, dp(8).toFloat(), 0f) else Chamfer(C.PANEL2, C.LINE, dp(8).toFloat())
-            }
-        }
-        for (k in items.indices) {
-            val t = label(items[k], 14f, C.MUTE, true)
-            t.setPadding(dp(16), dp(10), dp(16), dp(10))
-            t.setOnClickListener { cur = k; paint(); onSel(k) }
-            chips.add(t)
-            row.addView(t, LinearLayout.LayoutParams(-2, -2).also { it.rightMargin = dp(8) })
-        }
-        paint()
-        hs.addView(row)
-        return hs
-    }
-
-    private fun kmSync() { OverlayService.instance?.kmReload() }
-
-    private fun buildKeymap(col: LinearLayout) {
-        header(col, "KEYMAP  •  KETUK CEPAT")
-        val ready = Shz.ready()
-        val st = card()
-        st.addView(label(if (ready) "SHIZUKU TERHUBUNG" else "KEYMAP BUTUH SHIZUKU", 15f, if (ready) C.GREEN else C.RED, true, true))
-        st.addView(label("Tahan tombol bulat merah di layar game, dan titik biru yang jadi targetnya diketuk berulang otomatis. Cocok untuk tombol tembak.", 12f, C.MUTE))
-        if (!ready) st.addView(rogBtn("KE PENGATURAN SHIZUKU", true) { showTab(0) }, lp(-1, -2, 10))
-        col.addView(st, lp(-1, -2, 14))
-        col.addView(check("Aktifkan keymap saat Game Turbo", "kmOn"), lp(-1, -2, 8))
-
-        col.addView(section("CARA PAKAI"), lp(-2, -2, 18))
-        col.addView(label("1. Atur tombol di bawah.\n2. Tekan START di tab Turbo.\n3. Di dalam game, ketuk ikon Elaina lalu ATUR POSISI.\n4. Geser tombol merah ke tempat jarimu, dan lingkaran biru ke tombol game yang mau diketuk otomatis.\n5. Ketuk SELESAI ATUR, lalu mainkan.", 12f, C.MUTE), lp(-1, -2, 8))
-
-        col.addView(section("TOMBOL KAMU"), lp(-2, -2, 20))
-        val list = Km.load(this)
-        if (list.isEmpty()) col.addView(label("Belum ada tombol. Ketuk TAMBAH TOMBOL.", 13f, C.MUTE), lp(-1, -2, 10))
-        for (idx in list.indices) {
-            val km = list[idx]
-            val c = card()
-            c.addView(label("TOMBOL " + km.name, 16f, Color.WHITE, true, true))
-            c.addView(label("Cara kerja", 12f, C.MUTE), lp(-1, -2, 8))
-            c.addView(pickRow(listOf("Tahan", "Kunci"), km.mode) { km.mode = it; Km.save(this, list); kmSync() }, lp(-1, -2, 4))
-            c.addView(label("Kecepatan ketuk", 12f, C.MUTE), lp(-1, -2, 10))
-            c.addView(pickRow(Km.SPD, km.spd) { km.spd = it; Km.save(this, list); kmSync() }, lp(-1, -2, 4))
-            c.addView(rogBtn("HAPUS TOMBOL", false) {
-                list.removeAt(idx)
-                for (j in list.indices) list[j].name = "ABCDEF"[j.coerceIn(0, 5)].toString()
-                Km.save(this, list)
-                kmSync()
-                showTab(2)
-            }, lp(-1, -2, 12))
-            col.addView(c, lp(-1, -2, 10))
-        }
-        col.addView(rogBtn("+ TAMBAH TOMBOL", true) {
-            if (list.size >= 6) toast("Maksimal 6 tombol.") else {
-                list.add(Km.newItem(list.size))
-                Km.save(this, list)
-                kmSync()
-                showTab(2)
-            }
-        }, lp(-1, -2, 14))
-        col.addView(label("Tahan = ketuk otomatis selama kamu menahan. Kunci = ketuk sekali untuk mulai, ketuk lagi untuk berhenti.\nBiasa kira-kira 4 ketukan/detik, Sedang 8, Cepat 14. Gila = secepat HP mampu, biasanya sekitar 10 sampai 20 ketukan/detik.", 11f, C.MUTE), lp(-1, -2, 10))
-        col.addView(label("Banyak game online melarang auto-click. Pakai dengan risiko sendiri, paling aman di game offline.", 11f, C.RED), lp(-1, -2, 8))
-    }
-
-    // ================= MONITOR =================
-    private fun buildMonitor(col: LinearLayout) {
-        header(col, "MONITOR PERANGKAT")
-        val ramT = label("", 14f, C.TEXT, true)
-        val ramB = Bar(this)
-        val stoT = label("", 14f, C.TEXT, true)
-        val stoB = Bar(this)
-        val batT = label("", 14f, C.TEXT, true)
-        val batB = Bar(this)
-        val cpuT = label("", 14f, C.TEXT, true)
-        val thT = label("", 14f, C.TEXT, true)
-        val pingT = label("PING: mengukur...", 14f, C.TEXT, true)
-        val items = listOf(Pair(ramT, ramB), Pair(stoT, stoB), Pair(batT, batB))
-        for (p in items) {
-            val c = card()
-            c.addView(p.first)
-            c.addView(p.second, LinearLayout.LayoutParams(-1, dp(8)).also { it.topMargin = dp(8) })
-            col.addView(c, lp(-1, -2, 12))
-        }
-        val c2 = card()
-        c2.addView(cpuT)
-        c2.addView(thT, lp(-1, -2, 8))
-        c2.addView(pingT, lp(-1, -2, 8))
-        c2.addView(label("Perangkat: " + Build.MANUFACTURER + " " + Build.MODEL + "  •  Android " + Build.VERSION.RELEASE, 12f, C.MUTE), lp(-1, -2, 8))
-        col.addView(c2, lp(-1, -2, 12))
-        col.addView(label("Catatan: persentase CPU hanya tampil jika Shizuku terhubung (tab Turbo). Tanpa Shizuku yang tampil jumlah core dan frekuensi.", 11f, C.MUTE), lp(-1, -2, 10))
-        var n = 0
-        val r = object : Runnable {
-            override fun run() {
-                val (u, t, p) = Stats.ram(this@MainActivity)
-                ramT.text = "RAM:  $u / $t MB  ($p%)"; ramB.pct = p; ramB.invalidate()
-                val (su, stt, sp) = Stats.storage()
-                stoT.text = "PENYIMPANAN:  $su / $stt GB  ($sp%)"; stoB.pct = sp; stoB.col = C.CYAN; stoB.invalidate()
-                val (bp, bt) = Stats.battery(this@MainActivity)
-                batT.text = "BATERAI:  $bp%  •  " + "%.1f".format(bt) + "°C"; batB.pct = bp; batB.col = C.GREEN; batB.invalidate()
-                Stats.pollCpu()
-                cpuT.text = "CPU:  " + Stats.cpu()
-                thT.text = "STATUS SUHU:  " + Stats.thermal(this@MainActivity)
-                n++
-                if (n % 2 == 1) Stats.ping { ms -> pingT.text = if (ms < 0) "PING:  tidak terhubung" else "PING:  $ms ms" }
-                hd.postDelayed(this, 2000)
-            }
-        }
-        monitor = r
-        r.run()
-    }
-
-    // ================= SETELAN =================
-    private fun buildSettings(col: LinearLayout) {
-        header(col, "PENGATURAN")
-        col.addView(section("BENTUK GAMBAR"), lp(-2, -2, 20))
-        col.addView(label("Berlaku untuk semua gambar di aplikasi: foto profil, ikon game, dan lainnya.", 12f, C.MUTE), lp(-1, -2, 8))
-        col.addView(chipRow("imgShape", listOf("Lingkaran", "Kotak"), false) { showTab(4) }, lp(-1, -2, 10))
-        val av = ShapeImageView(this, s)
-        av.setImageResource(R.drawable.elaina)
-        col.addView(av, lp(dp(96), dp(96), 12))
-
-        col.addView(section("MODE FOKUS"), lp(-2, -2, 24))
-        col.addView(label("Saat Game Turbo menyala, notifikasi dibungkam (hanya alarm yang bunyi). Kembali normal saat dimatikan.", 12f, C.MUTE), lp(-1, -2, 8))
-        col.addView(check("Aktifkan mode fokus", "focus"))
-        val nm = getSystemService(NotificationManager::class.java)
-        val dnd = nm.isNotificationPolicyAccessGranted
-        col.addView(label("Izin Jangan Ganggu: " + if (dnd) "AKTIF" else "BELUM AKTIF", 13f, if (dnd) C.GREEN else C.RED, true), lp(-1, -2, 8))
-        if (!dnd) col.addView(rogBtn("BERI IZIN JANGAN GANGGU", false) { startActivity(Intent(Settings.ACTION_NOTIFICATION_POLICY_ACCESS_SETTINGS)) }, lp(-1, -2, 8))
-
-        col.addView(section("SCREENSHOT"), lp(-2, -2, 24))
-        col.addView(label("Android akan meminta izin rekam layar setiap kali START ditekan. Pilih Seluruh layar.", 12f, C.MUTE), lp(-1, -2, 8))
-        col.addView(check("Aktifkan screenshot di panel game", "shot"))
-
-        col.addView(section("IZIN"), lp(-2, -2, 24))
-        val ov = Settings.canDrawOverlays(this)
-        col.addView(label("Tampil di atas aplikasi lain: " + if (ov) "AKTIF" else "BELUM AKTIF", 13f, if (ov) C.GREEN else C.RED, true), lp(-1, -2, 8))
-        if (!ov) col.addView(rogBtn("BERI IZIN OVERLAY", true) { startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))) }, lp(-1, -2, 8))
-
-        col.addView(section("PANEL GAME"), lp(-2, -2, 24))
-        val pw = getSystemService(PowerManager::class.java)
-        val bat = pw.isIgnoringBatteryOptimizations(packageName)
-        col.addView(label("Penghemat baterai: " + if (bat) "DIMATIKAN untuk ELAINA" else "AKTIF (panel bisa hilang di game)", 13f, if (bat) C.GREEN else C.RED, true), lp(-1, -2, 8))
-        if (!bat) col.addView(rogBtn("MATIKAN PENGHEMAT BATERAI", true) {
-            try { startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName"))) }
-            catch (e: Exception) { toast("Buka Setelan > Baterai > ELAINA > Tanpa batasan.") }
-        }, lp(-1, -2, 8))
-        col.addView(rogBtn("RESET POSISI PANEL", false) {
-            s.set("pX", 0); s.set("pY", 200)
-            OverlayService.instance?.moveTo()
-            toast("Posisi panel dikembalikan.")
-        }, lp(-1, -2, 8))
-        col.addView(rogBtn("RESET SEMUA PENGATURAN", false) {
-            s.reset()
-            File(filesDir, "cut.png").delete()
-            File(filesDir, "src.png").delete()
-            OverlayService.instance?.refresh()
-            showTab(4)
-        }, lp(-1, -2, 24))
-        col.addView(label("ELAINA Optimasi v1.0", 11f, C.MUTE), lp(-1, -2, 12))
-    }
-
-    // ================= FOTO =================
     private fun loadPhoto(u: Uri) {
         ex.execute {
             try {
@@ -1274,6 +1978,7 @@ class MainActivity : Activity() {
                 pick?.bmp = r.first
                 pick?.invalidate()
                 preview?.photo = cut
+                preview2?.photo = cut
                 if (cut == null) toast("Semua area terhapus. Turunkan toleransi atau pilih warna latar lain.")
                 apply()
             }
@@ -1297,9 +2002,11 @@ cat > "app/src/main/java/com/crosshair/pro/OverlayService.kt" <<'__XH_EOF__'
 package com.crosshair.pro
 
 import android.app.*
+import android.content.BroadcastReceiver
 import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.content.res.Configuration
 import android.graphics.Bitmap
@@ -1317,6 +2024,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.SystemClock
 import android.provider.MediaStore
 import android.util.DisplayMetrics
 import android.view.Display
@@ -1348,7 +2056,13 @@ class OverlayService : Service() {
     private var ramBar: Bar? = null
     private var ovBtn: TextView? = null
     private var focusBtn: TextView? = null
+    private var kmStatT: TextView? = null
+    private var kmOnBtn: TextView? = null
+    private var kmEditBtn: TextView? = null
+    private var km: KeyLayer? = null
     private val chips = ArrayList<TextView>()
+    private val tabViews = ArrayList<TextView>()
+    private val tabBodies = ArrayList<LinearLayout>()
     private val bits = intArrayOf(1, 2, 4, 8, 16, 32)
     private var open = false
     private var added = false
@@ -1359,15 +2073,16 @@ class OverlayService : Service() {
     private var reader: ImageReader? = null
     private var shotBusy = false
     private var closing = false
-    private var km: KeyLayer? = null
-    private var kmOnBtn: TextView? = null
-    private var kmEditBtn: TextView? = null
+
+    private val screenOn = object : BroadcastReceiver() {
+        override fun onReceive(c: Context?, i: Intent?) { h.postDelayed({ watchdog() }, 600) }
+    }
 
     private val tick = object : Runnable {
         override fun run() {
             watchdog()
-            if (open) updateStats()
-            h.postDelayed(this, 2000)
+            if (open && s.i("ppage") == 4) updateStats()
+            h.postDelayed(this, 1500)
         }
     }
 
@@ -1378,6 +2093,7 @@ class OverlayService : Service() {
         instance = this
         s = Spec(this)
         wm = getSystemService(WINDOW_SERVICE) as WindowManager
+        try { registerReceiver(screenOn, IntentFilter(Intent.ACTION_SCREEN_ON)) } catch (e: Exception) { }
     }
 
     override fun onStartCommand(i: Intent?, f: Int, id: Int): Int {
@@ -1388,13 +2104,22 @@ class OverlayService : Service() {
         val proj = data != null && code == Activity.RESULT_OK
         startFg(proj)
         if (!added) {
-            addViews()
+            addViews(true)
             applyFocus(s.b("focus"))
             h.removeCallbacks(tick)
-            h.postDelayed(tick, 2000)
+            h.postDelayed(tick, 1500)
         }
         if (proj && projection == null && data != null) initProjection(code, data)
         return START_STICKY
+    }
+
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        try {
+            val pi = PendingIntent.getForegroundService(applicationContext, 7, Intent(applicationContext, OverlayService::class.java),
+                PendingIntent.FLAG_ONE_SHOT or PendingIntent.FLAG_IMMUTABLE)
+            getSystemService(AlarmManager::class.java).set(AlarmManager.ELAPSED_REALTIME, SystemClock.elapsedRealtime() + 1500, pi)
+        } catch (e: Exception) { }
+        super.onTaskRemoved(rootIntent)
     }
 
     override fun onConfigurationChanged(c: Configuration) {
@@ -1434,11 +2159,11 @@ class OverlayService : Service() {
         }
     }
 
-    // ---------- jendela overlay ----------
-    private fun addViews() {
+    // ================= jendela overlay =================
+    private fun addViews(first: Boolean) {
         try {
             val d = resources.displayMetrics.density
-            val size = (300 * d).toInt()
+            val size = (420 * d).toInt()
             val v = CrosshairView(this, s)
             v.photo = Store.cut(this)
             val lp = WindowManager.LayoutParams(
@@ -1455,7 +2180,11 @@ class OverlayService : Service() {
             v.visibility = if (s.b("ovOn")) View.VISIBLE else View.INVISIBLE
 
             open = false
-            if (km == null) km = KeyLayer(this, wm) { screen() }
+            if (km == null) {
+                val k = KeyLayer(this, wm) { screen() }
+                k.onEditChange = { h.post { paintKm() } }
+                km = k
+            }
             buildPanel()
             val pl = WindowManager.LayoutParams(
                 WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.WRAP_CONTENT,
@@ -1470,10 +2199,15 @@ class OverlayService : Service() {
             wm.addView(root, pl)
             added = true
             h.postDelayed({ clamp() }, 400)
-            if (s.b("kmOn")) startKm()
+            if (s.b("kmOn") && km?.shown != true) startKm(false)
         } catch (e: Exception) {
-            toast("Gagal menampilkan overlay. Pastikan izin Tampil di atas aplikasi lain aktif.")
-            stopSelf()
+            detachAll()
+            added = false
+            if (first) {
+                toast("Gagal menampilkan overlay. Pastikan izin Tampil di atas aplikasi lain aktif.")
+                stopSelf()
+            }
+            // saat dipanggil watchdog: jangan berhenti, coba lagi di putaran berikutnya
         }
     }
 
@@ -1484,17 +2218,20 @@ class OverlayService : Service() {
         root = null
     }
 
-    /** Pasang ulang overlay jika sistem/game melepasnya. */
+    /** Pasang ulang overlay jika sistem atau game melepasnya. */
     private fun watchdog() {
-        if (!added || shotBusy) return
+        if (closing || shotBusy) return
         try {
+            if (!added) { addViews(false); return }
             val a = xh
             val r = root
             if ((a != null && !a.isAttachedToWindow) || (r != null && !r.isAttachedToWindow)) {
                 detachAll()
                 added = false
-                addViews()
+                addViews(false)
             }
+            val k = km
+            if (k != null && k.shown && !k.isAttached()) k.reload()
         } catch (e: Exception) { }
     }
 
@@ -1513,7 +2250,7 @@ class OverlayService : Service() {
         val sv = scroll ?: return
         val b = body ?: return
         b.measure(View.MeasureSpec.makeMeasureSpec(dp(270), View.MeasureSpec.EXACTLY), View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED))
-        val maxH = minOf((screen().heightPixels * 0.78f).toInt(), dp(560))
+        val maxH = minOf((screen().heightPixels * 0.80f).toInt(), dp(560))
         val want = minOf(b.measuredHeight, maxH)
         val lp = sv.layoutParams as LinearLayout.LayoutParams
         if (lp.height != want) { lp.height = want; sv.layoutParams = lp }
@@ -1540,8 +2277,16 @@ class OverlayService : Service() {
         } catch (e: Exception) { }
         v.invalidate()
         paintChips()
+        paintToggles()
     }
 
+    fun kmReload() {
+        val k = km ?: return
+        if (k.shown) k.reload()
+        paintKm()
+    }
+
+    // ================= panel =================
     private fun paintChips() {
         for (k in chips.indices) {
             val on = (s.i("mask") and bits[k]) != 0 && !s.b("usePhoto")
@@ -1555,6 +2300,22 @@ class OverlayService : Service() {
         focusBtn?.text = if (s.b("focus")) "FOKUS: ON" else "FOKUS: OFF"
     }
 
+    private fun paintKm() {
+        val ready = Shz.ready()
+        val st = "Shizuku: " + (if (ready) "TERHUBUNG" else "MATI") + "   •   Mesin: " +
+            (if (Tap.fast) "CEPAT" else if (ready) "STANDAR" else "-")
+        kmStatT?.text = st
+        homeStat?.text = st + "   •   Keymap: " + (if (km?.shown == true) "ON" else "OFF")
+        kmOnBtn?.text = if (km?.shown == true) "KEYMAP: ON" else "KEYMAP: OFF"
+        kmEditBtn?.text = if (km?.edit == true) "SELESAI EDIT" else "EDIT TOMBOL"
+    }
+
+    private fun startKm(hint: Boolean) {
+        km?.show()
+        if (hint && !Shz.ready()) toast("Tombol tampil, tapi ketukan otomatis butuh Shizuku.")
+        paintKm()
+    }
+
     private fun resize(d: Int) {
         if (s.b("usePhoto")) { toast("Ukuran foto crosshair diatur di aplikasi ELAINA."); return }
         s.set("len", (s.i("len") + 2 * d).coerceIn(4, 50))
@@ -1564,46 +2325,62 @@ class OverlayService : Service() {
         refresh()
     }
 
-    private fun buildPanel() {
-        chips.clear()
-        val r = LinearLayout(this)
-        r.orientation = LinearLayout.VERTICAL
-        val b = LinearLayout(this)
-        b.orientation = LinearLayout.VERTICAL
-        b.setPadding(dp(12), dp(12), dp(12), dp(12))
-        b.background = Chamfer(0xF2101018.toInt(), C.RED, dp(14).toFloat(), 3f)
-        val t1 = label("ELAINA", 22f, Color.WHITE, true, true)
-        t1.setShadowLayer(12f, 0f, 0f, C.RED)
-        b.addView(t1)
-        b.addView(label("GAME TURBO  •  geser ikon untuk memindahkan", 10f, C.RED, true))
-        ramT = label("RAM", 12f, C.TEXT, true)
-        b.addView(ramT, lp(-1, -2, 10))
-        ramBar = Bar(this)
-        b.addView(ramBar, LinearLayout.LayoutParams(-1, dp(6)).also { it.topMargin = dp(4) })
-        cpuT = label("CPU", 12f, C.TEXT, true)
-        b.addView(cpuT, lp(-1, -2, 6))
-        batT = label("BAT", 12f, C.TEXT, true)
-        b.addView(batT, lp(-1, -2, 4))
-        pingT = label("PING", 12f, C.TEXT, true)
-        b.addView(pingT, lp(-1, -2, 4))
+    private fun small(t: TextView): TextView { t.textSize = 12f; return t }
 
-        b.addView(label("CROSSHAIR (gabungkan bebas)", 11f, C.CYAN, true), lp(-1, -2, 12))
+    private val pages = ArrayList<LinearLayout>()
+    private var homeV: LinearLayout? = null
+    private var homeStat: TextView? = null
+    private var titleT: TextView? = null
+    private var backBtn: TextView? = null
+    private val pageNames = listOf("MENU", "CROSSHAIR", "KEYMAP", "GRAFIK", "ALAT", "INFO")
+
+    private fun svcChips(items: List<String>, get: () -> Int, set: (Int) -> Unit): View {
+        val row = LinearLayout(this)
+        val tv = ArrayList<TextView>()
+        val paint = {
+            for (k in tv.indices) {
+                val on = get() == k
+                tv[k].setTextColor(if (on) Color.WHITE else C.MUTE)
+                tv[k].background = if (on) Chamfer(C.RED, 0, dp(6).toFloat(), 0f) else Chamfer(C.PANEL2, C.LINE, dp(6).toFloat())
+            }
+        }
+        for (k in items.indices) {
+            val t = label(items[k], 11f, C.MUTE, true)
+            t.gravity = Gravity.CENTER
+            t.setPadding(dp(2), dp(9), dp(2), dp(9))
+            t.setOnClickListener { set(k); paint() }
+            tv.add(t)
+            row.addView(t, lp(0, -2, 0, 1f).also { it.setMargins(dp(2), 0, dp(2), 0) })
+        }
+        paint()
+        return row
+    }
+
+    private fun pageCross(): LinearLayout {
+        val t = LinearLayout(this)
+        t.orientation = LinearLayout.VERTICAL
+        t.addView(label("Bentuk (boleh digabung)", 11f, C.CYAN, true))
         val sr = LinearLayout(this)
         val names = listOf("Plus", "X", "Cincin", "Titik", "Sudut", "Delta")
         for (k in names.indices) {
-            val t = label(names[k], 11f, C.MUTE, true)
-            t.gravity = Gravity.CENTER
-            t.setPadding(dp(2), dp(8), dp(2), dp(8))
-            t.setOnClickListener {
-                s.set("mask", s.i("mask") xor bits[k])
-                s.set("usePhoto", 0)
-                refresh()
-            }
-            chips.add(t)
-            sr.addView(t, lp(0, -2, 0, 1f).also { it.setMargins(dp(2), 0, dp(2), 0) })
+            val c = label(names[k], 11f, C.MUTE, true)
+            c.gravity = Gravity.CENTER
+            c.setPadding(dp(2), dp(8), dp(2), dp(8))
+            c.setOnClickListener { s.set("mask", s.i("mask") xor bits[k]); s.set("usePhoto", 0); refresh() }
+            chips.add(c)
+            sr.addView(c, lp(0, -2, 0, 1f).also { it.setMargins(dp(2), 0, dp(2), 0) })
         }
-        b.addView(sr, lp(-1, -2, 6))
-
+        t.addView(sr, lp(-1, -2, 6))
+        t.addView(label("Preset cepat", 11f, C.CYAN, true), lp(-1, -2, 10))
+        val pr = LinearLayout(this)
+        val pn = listOf("Klasik", "Sniper", "Siku", "Gabung")
+        val pv = intArrayOf(1, 13, 24, 29)
+        for (k in pn.indices) {
+            pr.addView(small(rogBtn(pn[k], false) { s.set("mask", pv[k]); s.set("usePhoto", 0); refresh() }),
+                lp(0, -2, 0, 1f).also { it.setMargins(dp(2), 0, dp(2), 0) })
+        }
+        t.addView(pr, lp(-1, -2, 6))
+        t.addView(label("Warna", 11f, C.CYAN, true), lp(-1, -2, 10))
         val cr = LinearLayout(this)
         val cols = intArrayOf(0xFF39FF88.toInt(), 0xFFFF1744.toInt(), 0xFFFFE600.toInt(), 0xFF00E5FF.toInt(), 0xFFFF4DFF.toInt(), 0xFFFFFFFF.toInt())
         for (c in cols) {
@@ -1616,8 +2393,7 @@ class OverlayService : Service() {
             v.setOnClickListener { s.set("color", c); refresh() }
             cr.addView(v, lp(0, dp(30), 0, 1f).also { it.setMargins(dp(3), 0, dp(3), 0) })
         }
-        b.addView(cr, lp(-1, -2, 8))
-
+        t.addView(cr, lp(-1, -2, 6))
         val sz = LinearLayout(this)
         sz.gravity = Gravity.CENTER_VERTICAL
         sz.addView(rogBtn("-", false) { resize(-1) }, lp(0, -2, 0, 1f))
@@ -1625,40 +2401,165 @@ class OverlayService : Service() {
         ul.gravity = Gravity.CENTER
         sz.addView(ul, lp(0, -2, 0, 1.4f))
         sz.addView(rogBtn("+", false) { resize(1) }, lp(0, -2, 0, 1f))
-        b.addView(sz, lp(-1, -2, 8))
+        t.addView(sz, lp(-1, -2, 10))
+        ovBtn = small(rogBtn("", false) { s.set("ovOn", if (s.b("ovOn")) 0 else 1); refresh() })
+        t.addView(ovBtn, lp(-1, -2, 10))
+        t.addView(label("Foto crosshair hanya bisa diubah di aplikasi ELAINA.", 10f, C.MUTE), lp(-1, -2, 8))
+        return t
+    }
 
-        val tg = LinearLayout(this)
-        ovBtn = rogBtn("", false) { s.set("ovOn", if (s.b("ovOn")) 0 else 1); refresh(); paintToggles() }
-        focusBtn = rogBtn("", false) { val nv = if (s.b("focus")) 0 else 1; s.set("focus", nv); applyFocus(nv == 1); paintToggles() }
-        ovBtn?.textSize = 12f
-        focusBtn?.textSize = 12f
-        tg.addView(ovBtn, lp(0, -2, 0, 1f).also { it.rightMargin = dp(4) })
-        tg.addView(focusBtn, lp(0, -2, 0, 1f).also { it.leftMargin = dp(4) })
-        b.addView(tg, lp(-1, -2, 10))
-
-        val kr = LinearLayout(this)
-        kmOnBtn = rogBtn("", false) {
+    private fun pageKeymap(): LinearLayout {
+        val t = LinearLayout(this)
+        t.orientation = LinearLayout.VERTICAL
+        kmStatT = label("", 11f, C.CYAN, true)
+        t.addView(kmStatT)
+        t.addView(label("Tahan tombol bulat merah = titik biru diketuk otomatis dan cepat.", 11f, C.TEXT), lp(-1, -2, 8))
+        val row = LinearLayout(this)
+        kmOnBtn = small(rogBtn("", false) {
             val nv = if (s.b("kmOn")) 0 else 1
             s.set("kmOn", nv)
-            if (nv == 1) startKm() else km?.hide()
-            paintKm()
-        }
-        kmEditBtn = rogBtn("", false) {
+            if (nv == 1) startKm(true) else { km?.hide(); paintKm() }
+        })
+        kmEditBtn = small(rogBtn("", true) {
             val k = km
-            if (k == null || !k.shown) toast("Nyalakan keymap dulu.") else { k.setEdit(!k.edit); paintKm() }
-        }
-        kmOnBtn?.textSize = 12f
-        kmEditBtn?.textSize = 12f
-        kr.addView(kmOnBtn, lp(0, -2, 0, 1f).also { it.rightMargin = dp(4) })
-        kr.addView(kmEditBtn, lp(0, -2, 0, 1f).also { it.leftMargin = dp(4) })
-        b.addView(kr, lp(-1, -2, 10))
+            if (k != null) {
+                if (!k.shown) { s.set("kmOn", 1); k.show() }
+                k.setEdit(!k.edit)
+                if (k.edit && open) toggle()
+                paintKm()
+            }
+        })
+        row.addView(kmOnBtn, lp(0, -2, 0, 1f).also { it.rightMargin = dp(4) })
+        row.addView(kmEditBtn, lp(0, -2, 0, 1f).also { it.leftMargin = dp(4) })
+        t.addView(row, lp(-1, -2, 10))
+        t.addView(label("Cara menambah tombol:\n1. Ketuk EDIT TOMBOL.\n2. Ketuk + TAMBAH.\n3. Seret tombol merah ke tempat jarimu.\n4. Seret lingkaran biru ke tombol game yang mau diketuk.\n5. Pilih Tahan/Kunci dan kecepatan, lalu SELESAI.", 11f, C.MUTE), lp(-1, -2, 10))
+        return t
+    }
 
-        b.addView(rogBtn("BERSIHKAN RAM", false) {
+    private fun pageTools(): LinearLayout {
+        val t = LinearLayout(this)
+        t.orientation = LinearLayout.VERTICAL
+        ramT = label("RAM", 12f, C.TEXT, true)
+        t.addView(ramT)
+        ramBar = Bar(this)
+        t.addView(ramBar, LinearLayout.LayoutParams(-1, dp(6)).also { it.topMargin = dp(4) })
+        cpuT = label("CPU", 12f, C.TEXT, true)
+        t.addView(cpuT, lp(-1, -2, 6))
+        batT = label("BAT", 12f, C.TEXT, true)
+        t.addView(batT, lp(-1, -2, 4))
+        pingT = label("PING", 12f, C.TEXT, true)
+        t.addView(pingT, lp(-1, -2, 4))
+        focusBtn = small(rogBtn("", false) { val nv = if (s.b("focus")) 0 else 1; s.set("focus", nv); applyFocus(nv == 1); paintToggles() })
+        t.addView(focusBtn, lp(-1, -2, 12))
+        t.addView(small(rogBtn("BERSIHKAN RAM", false) {
             if (Shz.ready()) Opt.clean(this) { toast(it) } else toast("Pembersih RAM butuh Shizuku (aktifkan di aplikasi ELAINA).")
-        }, lp(-1, -2, 10))
-        b.addView(rogBtn("SCREENSHOT", true) { shot() }, lp(-1, -2, 8))
-        b.addView(rogBtn("BERHENTI", false) { stopSelf() }, lp(-1, -2, 8))
-        b.addView(label("Foto crosshair hanya bisa diubah di aplikasi ELAINA.", 10f, C.MUTE), lp(-1, -2, 8))
+        }), lp(-1, -2, 8))
+        t.addView(small(rogBtn("SCREENSHOT", true) { shot() }), lp(-1, -2, 8))
+        return t
+    }
+
+    private fun gfxApply(resetFirst: Boolean) {
+        if (!Shz.ready()) { toast("Pengaturan grafik butuh Shizuku. Lihat tab AKTIVASI di aplikasi."); return }
+        val app = applicationContext
+        Thread { if (resetFirst) Opt.restore(app); Opt.apply(app, s, null) }.start()
+        toast("Diterapkan.")
+    }
+
+    private fun pageGfx(): LinearLayout {
+        val t = LinearLayout(this)
+        t.orientation = LinearLayout.VERTICAL
+        t.addView(label("Butuh Shizuku. Semua pengaturan dikembalikan otomatis saat Game Turbo dimatikan.", 10f, C.MUTE))
+        t.addView(label("Profil cepat", 11f, C.CYAN, true), lp(-1, -2, 8))
+        t.addView(svcChips(listOf("Normal", "Seimbang", "Performa", "Maks"), { s.i("perf") }) { v ->
+            val old = s.i("res")
+            Opt.preset(s, v)
+            gfxApply(old != s.i("res"))
+        }, lp(-1, -2, 4))
+        t.addView(label("Resolusi layar", 11f, C.CYAN, true), lp(-1, -2, 10))
+        t.addView(svcChips(listOf("100%", "90%", "80%", "70%", "60%"), { s.i("res") }) { v ->
+            val old = s.i("res")
+            s.set("res", v)
+            gfxApply(old != v)
+        }, lp(-1, -2, 4))
+        t.addView(label("Animasi sistem", 11f, C.CYAN, true), lp(-1, -2, 10))
+        t.addView(svcChips(listOf("Normal", "Cepat", "Mati"), { s.i("anim") }) { v -> s.set("anim", v); gfxApply(true) }, lp(-1, -2, 4))
+        t.addView(label("Refresh rate", 11f, C.CYAN, true), lp(-1, -2, 10))
+        t.addView(svcChips(listOf("Bawaan", "90", "120", "144"), { s.i("hz") }) { v -> s.set("hz", v); gfxApply(true) }, lp(-1, -2, 4))
+        t.addView(small(rogBtn("PULIHKAN SEMUA", false) {
+            Opt.preset(s, 0)
+            val app = applicationContext
+            Thread { Opt.restore(app) }.start()
+            toast("Pengaturan sistem dipulihkan.")
+        }), lp(-1, -2, 12))
+        t.addView(label("Ganti resolusi saat main bisa membuat game memuat ulang. Lebih aman dipilih sebelum START di aplikasi.", 10f, C.RED), lp(-1, -2, 8))
+        return t
+    }
+
+    private fun pageInfo(): LinearLayout {
+        val t = LinearLayout(this)
+        t.orientation = LinearLayout.VERTICAL
+        t.addView(label("CARA PAKAI MENU", 12f, C.CYAN, true))
+        t.addView(label("• Ketuk ikon Elaina = buka/tutup menu.\n• Tahan lalu geser ikon = pindahkan menu.\n• Tombol < = kembali ke halaman utama menu.\n• CROSSHAIR: bentuk (boleh digabung), warna, ukuran.\n• KEYMAP: ketukan otomatis (butuh Shizuku).\n• GRAFIK: profil performa, resolusi, animasi, refresh rate.\n• ALAT: RAM/CPU/ping, screenshot, bersihkan RAM, mode fokus.", 11f, C.TEXT), lp(-1, -2, 4))
+        t.addView(label("MENU HILANG SENDIRI?", 12f, C.RED, true), lp(-1, -2, 10))
+        t.addView(label("Buka aplikasi ELAINA > tab INFO, lalu ikuti daftar SIAP MAIN. Yang paling sering: matikan penghemat baterai dan izinkan jendela pop-up di latar belakang (Xiaomi).", 11f, C.MUTE), lp(-1, -2, 4))
+        t.addView(small(rogBtn("BERHENTI (matikan Game Turbo)", false) { stopSelf() }), lp(-1, -2, 12))
+        return t
+    }
+
+    private fun buildPanel() {
+        chips.clear()
+        pages.clear()
+        val r = LinearLayout(this)
+        r.orientation = LinearLayout.VERTICAL
+        val b = LinearLayout(this)
+        b.orientation = LinearLayout.VERTICAL
+        b.setPadding(dp(12), dp(12), dp(12), dp(12))
+        b.background = Chamfer(0xF2101018.toInt(), C.RED, dp(14).toFloat(), 3f)
+
+        val hr = LinearLayout(this)
+        hr.gravity = Gravity.CENTER_VERTICAL
+        val back = small(rogBtn("<", false) { showPage(0) })
+        back.visibility = View.GONE
+        backBtn = back
+        hr.addView(back, LinearLayout.LayoutParams(-2, -2))
+        val t1 = label("ELAINA", 20f, Color.WHITE, true, true)
+        t1.setShadowLayer(12f, 0f, 0f, C.RED)
+        titleT = t1
+        hr.addView(t1, lp(0, -2, 0, 1f).also { it.leftMargin = dp(8) })
+        hr.addView(small(rogBtn("TUTUP", false) { if (open) toggle() }), LinearLayout.LayoutParams(-2, -2))
+        b.addView(hr)
+        b.addView(label("GAME TURBO", 10f, C.RED, true))
+
+        val home = LinearLayout(this)
+        home.orientation = LinearLayout.VERTICAL
+        val hstat = label("", 10f, C.CYAN, true)
+        homeStat = hstat
+        home.addView(hstat, lp(-1, -2, 4))
+        val items = listOf(
+            Pair("CROSSHAIR", "bentuk, warna, ukuran"), Pair("KEYMAP", "ketuk otomatis"),
+            Pair("GRAFIK", "performa, resolusi"), Pair("ALAT", "RAM, CPU, screenshot"), Pair("INFO", "cara pakai"))
+        var row: LinearLayout? = null
+        for (i in items.indices) {
+            if (i % 2 == 0) { row = LinearLayout(this); home.addView(row, lp(-1, -2, 8)) }
+            val tile = LinearLayout(this)
+            tile.orientation = LinearLayout.VERTICAL
+            tile.setPadding(dp(10), dp(12), dp(10), dp(12))
+            tile.background = Chamfer(C.PANEL2, C.RED, dp(10).toFloat(), 2f)
+            tile.addView(label(items[i].first, 14f, Color.WHITE, true, true))
+            tile.addView(label(items[i].second, 10f, C.MUTE))
+            tile.setOnClickListener { showPage(i + 1) }
+            row?.addView(tile, lp(0, -2, 0, 1f).also { it.setMargins(dp(3), 0, dp(3), 0) })
+        }
+        if (items.size % 2 == 1) row?.addView(View(this), lp(0, 1, 0, 1f).also { it.setMargins(dp(3), 0, dp(3), 0) })
+        homeV = home
+        b.addView(home, lp(-1, -2, 8))
+
+        pages.add(pageCross())
+        pages.add(pageKeymap())
+        pages.add(pageGfx())
+        pages.add(pageTools())
+        pages.add(pageInfo())
+        for (pg in pages) { pg.visibility = View.GONE; b.addView(pg, lp(-1, -2, 10)) }
 
         val sv = ScrollView(this)
         sv.addView(b, LinearLayout.LayoutParams(-1, -2))
@@ -1702,30 +2603,23 @@ class OverlayService : Service() {
         paintChips()
         paintToggles()
         paintKm()
+        showPage(0)
     }
 
-    private fun startKm() {
-        if (!Shz.ready()) { toast("Keymap butuh Shizuku. Nyalakan Shizuku lalu mulai ulang Game Turbo."); return }
-        km?.show()
-        paintKm()
-    }
-
-    private fun paintKm() {
-        val on = km?.shown == true
-        kmOnBtn?.text = if (on) "KEYMAP: ON" else "KEYMAP: OFF"
-        kmEditBtn?.text = if (km?.edit == true) "SELESAI ATUR" else "ATUR POSISI"
-    }
-
-    fun kmReload() {
-        val k = km ?: return
-        if (k.shown) k.reload()
-        paintKm()
+    private fun showPage(k: Int) {
+        s.set("ppage", k)
+        homeV?.visibility = if (k == 0) View.VISIBLE else View.GONE
+        for (i in pages.indices) pages[i].visibility = if (i + 1 == k) View.VISIBLE else View.GONE
+        backBtn?.visibility = if (k == 0) View.GONE else View.VISIBLE
+        titleT?.text = if (k == 0) "ELAINA" else pageNames[k.coerceIn(0, 5)]
+        if (open) { fitScroll(); if (k == 4) updateStats() }
+        h.postDelayed({ clamp() }, 120)
     }
 
     private fun toggle() {
         open = !open
         scroll?.visibility = if (open) View.VISIBLE else View.GONE
-        if (open) { fitScroll(); updateStats() }
+        if (open) { paintKm(); fitScroll(); if (s.i("ppage") == 4) updateStats() }
         h.postDelayed({ clamp() }, 150)
     }
 
@@ -1746,7 +2640,7 @@ class OverlayService : Service() {
         try {
             val nm = getSystemService(NotificationManager::class.java)
             if (!nm.isNotificationPolicyAccessGranted) {
-                if (on) toast("Mode fokus butuh izin Jangan Ganggu. Aktifkan di Setelan aplikasi.")
+                if (on) toast("Mode fokus butuh izin Jangan Ganggu. Aktifkan di tab INFO aplikasi.")
                 return
             }
             if (on) {
@@ -1759,7 +2653,7 @@ class OverlayService : Service() {
         } catch (e: Exception) { }
     }
 
-    // ---------- screenshot ----------
+    // ================= screenshot =================
     private fun initProjection(code: Int, data: Intent) {
         try {
             val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
@@ -1861,9 +2755,11 @@ class OverlayService : Service() {
     override fun onDestroy() {
         closing = true
         h.removeCallbacksAndMessages(null)
+        try { unregisterReceiver(screenOn) } catch (e: Exception) { }
         applyFocus(false)
         try { km?.hide() } catch (e: Exception) { }
         km = null
+        Thread { Tap.shutdown() }.start()
         detachAll()
         try { vd?.release() } catch (e: Exception) { }
         try { reader?.close() } catch (e: Exception) { }
@@ -1889,7 +2785,7 @@ object Painter {
 
     fun draw(c: Canvas, cx: Float, cy: Float, sc: Float, s: Spec, photo: Bitmap?) {
         val rot = s.i("rot").toFloat()
-        if (s.b("usePhoto") && photo != null) { drawPhoto(c, cx, cy, sc, s, photo, rot); return }
+        if (s.b("usePhoto") && photo != null) { drawPhoto(c, cx, cy, sc, s, photo, s.i("pRot").toFloat()); return }
         val mask = s.i("mask")
         if (mask == 0) return
         val th = s.i("th") * sc
@@ -1953,7 +2849,9 @@ object Painter {
         }
     }
 
-    private fun drawPhoto(c: Canvas, cx: Float, cy: Float, sc: Float, s: Spec, photo: Bitmap, rot: Float) {
+    private fun drawPhoto(c: Canvas, cx0: Float, cy0: Float, sc: Float, s: Spec, photo: Bitmap, rot: Float) {
+        val cx = cx0 + s.i("pDx") * sc
+        val cy = cy0 + s.i("pDy") * sc
         val size = s.i("pSize") * sc
         val pp = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG)
         pp.alpha = s.i("pOp") * 255 / 100
@@ -2040,6 +2938,7 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Handler
 import android.os.Looper
+import android.provider.Settings
 import rikka.shizuku.Shizuku
 
 object Shz {
@@ -2058,9 +2957,7 @@ object Shz {
     /** Blocking. Jalankan hanya dari thread latar. */
     fun exec(cmd: String): String {
         return try {
-            val m = Shizuku::class.java.getDeclaredMethod("newProcess", Array<String>::class.java, Array<String>::class.java, String::class.java)
-            m.isAccessible = true
-            val p = m.invoke(null, arrayOf("sh", "-c", "($cmd) 2>&1"), null, null) as Process
+            val p = proc(arrayOf("sh", "-c", "($cmd) 2>&1"))
             val out = p.inputStream.bufferedReader().readText()
             p.waitFor()
             out.trim()
@@ -2069,17 +2966,38 @@ object Shz {
 }
 
 object Opt {
+    val RES = intArrayOf(100, 90, 80, 70, 60)
     private val KEYS = listOf(
         "global:window_animation_scale", "global:transition_animation_scale", "global:animator_duration_scale",
-        "system:min_refresh_rate", "system:peak_refresh_rate"
+        "system:min_refresh_rate", "system:peak_refresh_rate", "global:low_power"
     )
     private fun prefs(c: Context) = c.getSharedPreferences("xh_opt", Context.MODE_PRIVATE)
     private fun ui(f: () -> Unit) { Handler(Looper.getMainLooper()).post { f() } }
 
-    /** Jalankan dari thread latar saat Game Turbo START. */
+    fun secureOk(c: Context): Boolean = c.checkSelfPermission("android.permission.WRITE_SECURE_SETTINGS") == PackageManager.PERMISSION_GRANTED
+
+    fun keepAlive(c: Context) {
+        val pk = c.packageName
+        Shz.exec("cmd deviceidle whitelist +$pk; cmd appops set $pk RUN_ANY_IN_BACKGROUND allow; cmd appops set $pk RUN_IN_BACKGROUND allow; am set-standby-bucket $pk active")
+    }
+
+    /** Profil cepat: 0 Normal, 1 Seimbang, 2 Performa, 3 Maksimal. */
+    fun preset(s: Spec, n: Int) {
+        when (n) {
+            0 -> { s.set("autoClean", 0); s.set("gmode", 0); s.set("anim", 0); s.set("hz", 0); s.set("res", 0); s.set("fperf", 0) }
+            1 -> { s.set("autoClean", 1); s.set("gmode", 1); s.set("anim", 1); s.set("hz", 0); s.set("res", 0); s.set("fperf", 0) }
+            2 -> { s.set("autoClean", 1); s.set("gmode", 1); s.set("anim", 1); s.set("hz", 2); s.set("res", 1); s.set("fperf", 0) }
+            else -> { s.set("autoClean", 1); s.set("gmode", 1); s.set("anim", 2); s.set("hz", 2); s.set("res", 2); s.set("fperf", 1) }
+        }
+        s.set("perf", n)
+    }
+
+    /** Terapkan pengaturan performa dan grafik. Jalankan dari thread latar. */
     fun apply(c: Context, s: Spec, pkg: String?) {
-        if (!Shz.ready()) return
+        if (!Shz.ready()) { applyLite(c, s); return }
         val p = prefs(c)
+        if (pkg != null) p.edit().putString("lastPkg", pkg).apply()
+        keepAlive(c)
         if (!p.getBoolean("active", false)) {
             val ed = p.edit()
             for (k in KEYS) {
@@ -2101,16 +3019,68 @@ object Opt {
             Shz.exec("settings put system min_refresh_rate $v")
             Shz.exec("settings put system peak_refresh_rate $v")
         }
-        if (s.b("gmode") && pkg != null) {
-            Shz.exec("cmd game mode performance $pkg")
-            p.edit().putString("gpkg", pkg).apply()
+        if (s.i("perf") >= 1) Shz.exec("settings put global low_power 0")
+        val gp = pkg ?: p.getString("lastPkg", null)
+        if (s.b("gmode") && gp != null) {
+            Shz.exec("cmd game mode performance $gp")
+            p.edit().putString("gpkg", gp).apply()
+        }
+        if (s.b("fperf")) {
+            Shz.exec("cmd power set-fixed-performance-mode-enabled true")
+            p.edit().putBoolean("fperfOn", true).apply()
+        }
+        val r = s.i("res")
+        if (r > 0) {
+            val pct = RES[r.coerceIn(0, 4)]
+            val sz = Regex("Physical size: (\\d+)x(\\d+)").find(Shz.exec("wm size"))
+            val dn = Regex("Physical density: (\\d+)").find(Shz.exec("wm density"))
+            if (sz != null && dn != null) {
+                val w = sz.groupValues[1].toInt()
+                val h = sz.groupValues[2].toInt()
+                val d = dn.groupValues[1].toInt()
+                val w2 = (w * pct / 100) / 2 * 2
+                val h2 = (h * pct / 100) / 2 * 2
+                val d2 = d * pct / 100
+                Shz.exec("wm size " + w2 + "x" + h2)
+                Shz.exec("wm density $d2")
+                p.edit().putBoolean("resOn", true).apply()
+            }
         }
     }
 
-    /** Kembalikan pengaturan sistem seperti semula. */
+    /** Tanpa Shizuku tetapi izin WRITE_SECURE_SETTINGS sudah diberikan lewat ADB: hanya animasi. */
+    private fun applyLite(c: Context, s: Spec) {
+        if (!secureOk(c)) return
+        val an = s.i("anim")
+        if (an == 0) return
+        try {
+            val p = prefs(c)
+            val cr = c.contentResolver
+            if (!p.getBoolean("lite", false)) {
+                val ed = p.edit()
+                for (key in listOf("window_animation_scale", "transition_animation_scale", "animator_duration_scale"))
+                    ed.putString("lite_$key", Settings.Global.getString(cr, key))
+                ed.putBoolean("lite", true).apply()
+            }
+            val v = if (an == 1) "0.5" else "0"
+            for (key in listOf("window_animation_scale", "transition_animation_scale", "animator_duration_scale"))
+                Settings.Global.putString(cr, key, v)
+        } catch (e: Exception) { }
+    }
+
+    /** Kembalikan semua pengaturan sistem seperti semula. */
     fun restore(c: Context) {
         val p = prefs(c)
-        if (!p.getBoolean("active", false)) return
+        if (p.getBoolean("lite", false) && secureOk(c)) {
+            try {
+                for (key in listOf("window_animation_scale", "transition_animation_scale", "animator_duration_scale")) {
+                    val v = p.getString("lite_$key", null)
+                    Settings.Global.putString(c.contentResolver, key, v ?: "1")
+                }
+            } catch (e: Exception) { }
+            p.edit().putBoolean("lite", false).apply()
+        }
+        if (!p.getBoolean("active", false) && !p.getBoolean("resOn", false)) return
         if (!Shz.ready()) return
         for (k in KEYS) {
             val parts = k.split(":")
@@ -2120,7 +3090,11 @@ object Opt {
         }
         val g = p.getString("gpkg", null)
         if (g != null) Shz.exec("cmd game mode standard $g")
+        if (p.getBoolean("fperfOn", false)) Shz.exec("cmd power set-fixed-performance-mode-enabled false")
+        if (p.getBoolean("resOn", false)) Shz.exec("wm size reset; wm density reset")
+        val last = p.getString("lastPkg", null)
         p.edit().clear().apply()
+        if (last != null) p.edit().putString("lastPkg", last).apply()
     }
 
     fun clean(c: Context, cb: (String) -> Unit) {
@@ -2138,10 +3112,12 @@ object Opt {
         val pk = c.packageName
         Thread {
             Shz.exec("appops set $pk SYSTEM_ALERT_WINDOW allow")
+            Shz.exec("appops set $pk 10021 allow")
             Shz.exec("cmd notification allow_dnd $pk")
             Shz.exec("pm grant $pk android.permission.POST_NOTIFICATIONS")
-            Shz.exec("cmd deviceidle whitelist +$pk")
-            ui { cb("Izin diberikan lewat Shizuku. Cek di tab Setelan.") }
+            Shz.exec("pm grant $pk android.permission.WRITE_SECURE_SETTINGS")
+            keepAlive(c)
+            ui { cb("Izin diberikan lewat Shizuku (termasuk jendela pop-up di latar untuk Xiaomi). Cek di tab INFO.") }
         }.start()
     }
 
@@ -2172,13 +3148,14 @@ class Spec(ctx: Context) {
     companion object {
         val D = mapOf(
             "color" to 0xFF39FF88.toInt(), "len" to 14, "th" to 3, "gap" to 5,
-            "rot" to 0, "op" to 100, "outline" to 1, "dotSize" to 4, "ring" to 22,
-            "mask" to 1,
+            "rot" to 0, "op" to 100, "outline" to 1, "dotSize" to 4, "ring" to 22, "mask" to 1,
             "usePhoto" to 0, "pSize" to 70, "pOp" to 100, "tint" to 0, "pShape" to 0, "pRing" to 0,
+            "pRot" to 0, "pDx" to 0, "pDy" to 0,
             "tol" to 40, "feather" to 1, "mode" to 0, "offX" to 0, "offY" to 0, "hasBg" to 0, "bgColor" to 0,
             "imgShape" to 0, "ovOn" to 1, "focus" to 1, "shot" to 1,
-            "pX" to 0, "pY" to 200,
-            "kmOn" to 1, "autoClean" to 1, "anim" to 0, "hz" to 0, "gmode" to 1
+            "pX" to 0, "pY" to 200, "ppage" to 0,
+            "kmOn" to 1, "kmEng" to 0,
+            "perf" to 0, "autoClean" to 1, "anim" to 0, "hz" to 0, "gmode" to 1, "res" to 0, "fperf" to 0
         )
     }
 
